@@ -143,7 +143,12 @@ class MarketingAgent(Agent):
             f"نام پروژه: {project_name}\n"
         )
 
-        result = call_model(system_prompt, user_context, no_think=True)
+        try:
+            result = call_model(system_prompt, user_context, no_think=True)
+        except Exception:
+            # Phase 7: log the failed delegation, then re-raise unchanged.
+            self._log_action(task, project_name, failed=True)
+            raise
 
         # Log that we generated content (for audit/journal purposes).
         self._log_action(task, project_name)
@@ -154,6 +159,7 @@ class MarketingAgent(Agent):
         self,
         task: str,
         project_name: str,
+        failed: bool = False,
     ) -> None:
         """
         Log this agent's action using the shared record_action if available.
@@ -163,6 +169,16 @@ class MarketingAgent(Agent):
         record_action = self.tools.get("record_action")
         if record_action is None:
             return
+
+        # Only fields record_action already supports. On the success path
+        # this dict is empty, so the call is identical to before.
+        failure_fields = (
+            {
+                "execution_state": "failed",
+                "result_summary": "call_model failed",
+            }
+            if failed else {}
+        )
 
         try:
             record_action(
@@ -176,6 +192,7 @@ class MarketingAgent(Agent):
                 project=project_name,
                 agent_id="marketing_agent",
                 agent_type="sub-agent",
+                **failure_fields,
             )
         except Exception:
             # Journal should never break agent execution.

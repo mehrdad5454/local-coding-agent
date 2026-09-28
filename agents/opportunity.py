@@ -314,7 +314,12 @@ class OpportunityAgent(Agent):
 
         user_context = "\n\n".join(user_context_parts)
 
-        result = call_model(system_prompt, user_context, no_think=True)
+        try:
+            result = call_model(system_prompt, user_context, no_think=True)
+        except Exception:
+            # Phase 7: log the failed delegation, then re-raise unchanged.
+            self._log_action(task, project_name, failed=True)
+            raise
 
         # Log this action for audit/journal purposes.
         self._log_action(task, project_name)
@@ -325,6 +330,7 @@ class OpportunityAgent(Agent):
         self,
         task: str,
         project_name: str,
+        failed: bool = False,
     ) -> None:
         """
         Log this agent's action using the shared record_action if available.
@@ -333,6 +339,16 @@ class OpportunityAgent(Agent):
         record_action = self.tools.get("record_action")
         if record_action is None:
             return
+
+        # Only fields record_action already supports. On the success path
+        # this dict is empty, so the call is identical to before.
+        failure_fields = (
+            {
+                "execution_state": "failed",
+                "result_summary": "call_model failed",
+            }
+            if failed else {}
+        )
 
         try:
             record_action(
@@ -346,6 +362,7 @@ class OpportunityAgent(Agent):
                 project=project_name,
                 agent_id="opportunity_agent",
                 agent_type="sub-agent",
+                **failure_fields,
             )
         except Exception:
             # Journal should never break agent execution.

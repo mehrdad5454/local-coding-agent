@@ -249,7 +249,14 @@ class ResearchAgent(Agent):
 
         user_context = "\n\n".join(user_context_parts)
 
-        result = call_model(system_prompt, user_context, no_think=True)
+        try:
+            result = call_model(system_prompt, user_context, no_think=True)
+        except Exception:
+            # Phase 7: شکست call_model هم ثبت می‌شود تا عیب‌یابی از
+            # ژورنال ممکن باشد، سپس استثنا عیناً بالا می‌رود
+            # (مانند قبل — نه swallow می‌شود و نه fallback را تغییر می‌دهد).
+            self._log_action(task, project_name, failed=True)
+            raise
 
         # Log this action for audit/journal purposes.
         self._log_action(task, project_name)
@@ -260,6 +267,7 @@ class ResearchAgent(Agent):
         self,
         task: str,
         project_name: str,
+        failed: bool = False,
     ) -> None:
         """
         Log this agent's action using the shared record_action if available.
@@ -268,6 +276,17 @@ class ResearchAgent(Agent):
         record_action = self.tools.get("record_action")
         if record_action is None:
             return
+
+        # فقط از فیلدهایی استفاده می‌کند که record_action از قبل پشتیبانی
+        # می‌کند. در مسیر موفقیت این dict خالی است، پس فراخوانی
+        # record_action دقیقاً همان آرگومان‌های قبلی را می‌گیرد.
+        failure_fields = (
+            {
+                "execution_state": "failed",
+                "result_summary": "call_model failed",
+            }
+            if failed else {}
+        )
 
         try:
             record_action(
@@ -284,6 +303,7 @@ class ResearchAgent(Agent):
                 project=project_name,
                 agent_id="research_agent",
                 agent_type="sub-agent",
+                **failure_fields,
             )
         except Exception:
             # Journal should never break agent execution.
