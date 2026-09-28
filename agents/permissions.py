@@ -165,7 +165,15 @@ class AgentPermissionModel:
                 Capability.ANALYSIS.value,
                 Capability.REPORT.value,
             },
-            allowed_tools={"call_model", "read_file", "safe_path"},
+            allowed_tools={
+                "call_model",
+                "read_file",
+                "safe_path",
+                # Phase 9 Section 2B: read-only project-wide phrase search.
+                # It cannot write (restricted_tools unchanged) and always
+                # stays inside the project root. Other agents are untouched.
+                "search_in_files",
+            },
             restricted_tools={"write_file", "write_file_multi"},
         )
 

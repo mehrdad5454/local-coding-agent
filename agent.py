@@ -10408,6 +10408,10 @@ def run_agent(
                             "call_model": call_model,
                             "read_file": read_file,
                             "safe_path": safe_path,
+                            # Phase 9 Section 2B: read-only project-wide
+                            # phrase search, shared with the sub-agents.
+                            # Read-only and bounded; no write capability.
+                            "search_in_files": search_in_files,
                             "is_write_allowed": is_write_allowed,
                             "is_stop_requested": is_stop_requested,
                             "record_action": record_action,
