@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+action-journal.json
+chat-history.db
+_shared_state_locations.txt
+projects.json
+
+# Backups
+.agent-backup-web/
+*.backup
+*.backup-*
+*.bak
+
+# Temporary / local artifacts
+2000))
