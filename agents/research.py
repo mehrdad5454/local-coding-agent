@@ -30,6 +30,20 @@ MAX_REFERENCED_FILES = 2
 # stays bounded regardless of how many files are read.
 MAX_TOTAL_FILE_CONTENT = 4000
 
+# Phase 9 Section 2A: safety floor for the per-file share. It is used ONLY in
+# the degenerate edge case where (remaining budget // remaining files) rounds
+# down to 0, so a referenced file is never dropped silently. It is NOT an extra
+# allowance: every block still fits inside its own share, the truncation notice
+# is paid for out of that same share, and the unreadable-file notice is shorter
+# than this floor. The TOTAL cap MAX_TOTAL_FILE_CONTENT above therefore remains
+# absolute — the sum of all injected file content never exceeds it.
+MIN_FILE_CONTENT = 200
+
+# Phase 9 Section 2A: appended when a file is truncated. It is charged to the
+# same per-file share as the content itself, so the notice never increases the
+# total injected characters beyond MAX_TOTAL_FILE_CONTENT.
+TRUNCATION_NOTICE = "\n...[محتوای فایل به دلیل محدودیت حجم ناقص است]"
+
 
 class ResearchAgent(Agent):
     """
@@ -141,35 +155,110 @@ class ResearchAgent(Agent):
         # Read any file mentioned in the request for context.
         file_paths = self._find_referenced_file(user_request, project_root)
 
-        # Phase 9 Section 1: read up to MAX_REFERENCED_FILES files using one
-        # shared character budget, so total injected content stays bounded.
-        file_blocks: List[str] = []
-        budget = MAX_TOTAL_FILE_CONTENT
-        for file_path in file_paths:
-            if budget <= 0:
-                break
-            if project_root:
-                content = self._read_project_file(project_root, file_path)
-            else:
-                content = ""
-            if not content:
-                continue
-            chunk = content[:budget]
-            budget -= len(chunk)
-            file_blocks.append(
-                f"فایل مرجع: {file_path}\n"
-                f"محتوای فایل:\n{chunk}"
-                + ("..." if len(content) > len(chunk) else "")
+        # Phase 9 Section 2A: assemble the referenced-file context with a fair,
+        # dynamic per-file allocation inside the SAME total budget, so every
+        # referenced file gets a chance to contribute and nothing is dropped
+        # silently.
+        file_content = self._build_file_content_blocks(
+            file_paths,
+            project_root,
+        )
+
+        # Emergency Stop may have been triggered while the files were being
+        # read. Never start an LLM call after that.
+        if self._is_stopped():
+            return (
+                "ResearchAgent متوقف شد: حالت اضطراری فعال است."
             )
 
         # Generate analysis using the shared LLM interface.
         result = self._analyze_request(
             task,
             project_name=project_name,
-            file_content="\n\n".join(file_blocks),
+            file_content=file_content,
         )
 
         return result
+
+    def _build_file_content_blocks(
+        self,
+        file_paths: List[str],
+        project_root: str,
+    ) -> str:
+        """
+        Build the referenced-file context for the analysis prompt.
+
+        Phase 9 Section 2A. The total character budget stays at
+        MAX_TOTAL_FILE_CONTENT and is never increased, but it is shared fairly
+        instead of greedily:
+
+        - the budget still left is divided by the number of files still to
+          process, so the last referenced file is guaranteed a real share;
+        - a file that is shorter than its share returns the unused remainder to
+          the budget, so later files can use it;
+        - a file that is longer than its share is truncated and marked as
+          truncated — no content is ever invented;
+        - a file that cannot be read gets a short explicit note instead of
+          being dropped without a trace.
+
+        The file list itself is still produced by _find_referenced_file(), so
+        the safe_path check and the MAX_REFERENCED_FILES cap are preserved.
+
+        Returns the joined blocks, or an empty string when there is nothing
+        to inject.
+        """
+        if not file_paths or not project_root:
+            return ""
+
+        blocks: List[str] = []
+        budget = MAX_TOTAL_FILE_CONTENT
+        total = len(file_paths)
+
+        for index, file_path in enumerate(file_paths):
+            remaining_files = total - index
+
+            # Fair share: what is left, divided among what is still to come.
+            share = budget // remaining_files
+            if share <= 0:
+                # Hard floor: every file still gets a real (small) share so no
+                # referenced file disappears silently. The total budget cap
+                # stays authoritative once the floor is hit.
+                share = MIN_FILE_CONTENT
+
+            if self._is_stopped():
+                return "\n\n".join(blocks)
+
+            content = self._read_project_file(project_root, file_path)
+
+            if not content:
+                # Explicit, honest indication. No content is fabricated, and
+                # the notice itself is charged to the same shared budget.
+                body = "در دسترس نیست (فایل خوانده نشد یا یافت نشد)."
+                budget -= len(body)
+                blocks.append(
+                    f"فایل مرجع: {file_path}\n"
+                    f"محتوای فایل:\n{body}"
+                )
+                continue
+
+            if len(content) <= share:
+                # Short file: injected completely, and the unused part of its
+                # share is handed back to the budget for the next file.
+                body = content
+            else:
+                # Long file: truncated. The truncation notice is paid for out
+                # of the same share, so it can never push the total over
+                # MAX_TOTAL_FILE_CONTENT.
+                room = max(share - len(TRUNCATION_NOTICE), 0)
+                body = content[:room] + TRUNCATION_NOTICE
+
+            budget -= len(body)
+            blocks.append(
+                f"فایل مرجع: {file_path}\n"
+                f"محتوای فایل:\n{body}"
+            )
+
+        return "\n\n".join(blocks)
 
     def _is_stopped(self) -> bool:
         """Check if the shared stop_event has been triggered."""
