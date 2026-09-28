@@ -22,6 +22,15 @@ from .base import Agent
 from .persona import PersonaRegistry
 
 
+# Phase 9 Section 1: read at most this many explicitly referenced files.
+MAX_REFERENCED_FILES = 2
+
+# Phase 9 Section 1: combined character budget for ALL injected file
+# content. This is a total, not a per-file allowance, so context size
+# stays bounded regardless of how many files are read.
+MAX_TOTAL_FILE_CONTENT = 4000
+
+
 class ResearchAgent(Agent):
     """
     Specialized agent for research and analysis tasks.
@@ -130,19 +139,34 @@ class ResearchAgent(Agent):
         user_request = kwargs.get("user_request", task)
 
         # Read any file mentioned in the request for context.
-        file_path = self._find_referenced_file(user_request, project_root)
-        file_content = ""
-        if file_path and project_root:
-            file_content = self._read_project_file(
-                project_root, file_path
+        file_paths = self._find_referenced_file(user_request, project_root)
+
+        # Phase 9 Section 1: read up to MAX_REFERENCED_FILES files using one
+        # shared character budget, so total injected content stays bounded.
+        file_blocks: List[str] = []
+        budget = MAX_TOTAL_FILE_CONTENT
+        for file_path in file_paths:
+            if budget <= 0:
+                break
+            if project_root:
+                content = self._read_project_file(project_root, file_path)
+            else:
+                content = ""
+            if not content:
+                continue
+            chunk = content[:budget]
+            budget -= len(chunk)
+            file_blocks.append(
+                f"فایل مرجع: {file_path}\n"
+                f"محتوای فایل:\n{chunk}"
+                + ("..." if len(content) > len(chunk) else "")
             )
 
         # Generate analysis using the shared LLM interface.
         result = self._analyze_request(
             task,
             project_name=project_name,
-            file_path=file_path,
-            file_content=file_content,
+            file_content="\n\n".join(file_blocks),
         )
 
         return result
@@ -157,12 +181,13 @@ class ResearchAgent(Agent):
         self,
         user_request: str,
         project_root: str,
-    ) -> Optional[str]:
+    ) -> List[str]:
         """
-        Look for a filename reference in the request.
+        Find explicitly referenced project files in the request.
 
-        Returns the path if found, None otherwise.
-        Uses simple pattern matching — not a full parser.
+        Returns the paths in order of appearance, capped at MAX_REFERENCED_FILES.
+        Every candidate still passes through safe_path, so path traversal stays
+        blocked. Returns an empty list when nothing valid is referenced.
         """
         import re
 
@@ -170,20 +195,22 @@ class ResearchAgent(Agent):
         pattern = r"([\w./-]+\.\w+)"
         matches = re.findall(pattern, user_request)
 
+        found: List[str] = []
         for match in matches:
             # Verify the file exists in the project (read-only check).
-            full_path = None
             safe_path_tool = self.tools.get("safe_path")
             if safe_path_tool and project_root:
                 try:
                     full_path = safe_path_tool(project_root, match)
                     import os
-                    if os.path.isfile(full_path):
-                        return match
+                    if os.path.isfile(full_path) and match not in found:
+                        found.append(match)
+                        if len(found) >= MAX_REFERENCED_FILES:
+                            break
                 except Exception:
                     pass
 
-        return None
+        return found
 
     def _read_project_file(
         self,
@@ -208,13 +235,15 @@ class ResearchAgent(Agent):
         self,
         task: str,
         project_name: str,
-        file_path: Optional[str],
         file_content: str,
     ) -> str:
         """
         Generate research/analysis output using the shared LLM.
 
         Uses the tools dict to access call_model — does NOT duplicate it.
+
+        `file_content` is the already-assembled, budget-bounded block of
+        referenced file content built by run() (empty string when none).
         """
         call_model = self.get_tool("call_model")
 
@@ -235,17 +264,8 @@ class ResearchAgent(Agent):
             f"نام پروژه: {project_name}",
         ]
 
-        if file_path and file_content:
-            user_context_parts.append(
-                f"\nفایل مرجع: {file_path}\n"
-                f"محتوای فایل:\n{file_content[:3000]}"
-                + ("..." if len(file_content) > 3000 else "")
-            )
-        elif file_path and not file_content:
-            user_context_parts.append(
-                f"\nفایل مرجع ذکر شده: {file_path} "
-                "(قابل خواندن نبود یا یافت نشد)"
-            )
+        if file_content:
+            user_context_parts.append("\n" + file_content)
 
         user_context = "\n\n".join(user_context_parts)
 
