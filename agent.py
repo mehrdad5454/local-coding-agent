@@ -2079,6 +2079,43 @@ SYNTAX_TIMEOUT_SECONDS = 30
 # حداکثر طول متن خطا که گزارش می‌شود.
 VALIDATION_ERROR_LIMIT = 2000
 
+# ---------------------------------------------------------
+# Step 3 — Verify بعد از Mutation + Error Feedback
+# ---------------------------------------------------------
+#
+# این لایه هیچ چیز جدیدی را «مالک» نمی‌شود: همان
+# validate_written_file / check_file_syntax موجود را می‌خواند و
+# نتیجه را ساختاریافته به مدل برمی‌گرداند. هیچ فایلی تغییر
+# نمی‌کند، هیچ Rollback/Approval ای را دور نمی‌زند و هیچ
+# ابزار بیرونی نصب یا اجرا نمی‌کند.
+
+# حداکثر طول پیام خطای هر فایل در Feedback.
+VERIFY_ERROR_CHARS = 400
+
+# حداکثر طول کل Feedback که به مدل داده می‌شود.
+VERIFY_FEEDBACK_CHARS = 1200
+
+# حداکثر تعداد خطایی که در Feedback فهرست می‌شود.
+VERIFY_MAX_ERRORS = 5
+
+# سقف context ای که برای «یک فرصت اصلاح» به مدل داده می‌شود.
+# بزرگ‌تر از این، اصلاح انجام نمی‌شود (Fail Closed) تا هرگز
+# محتوای ناقص به مدل داده نشود و فایل ناقص نوشته نشود.
+MAX_CORRECTION_FILES = 5
+MAX_CORRECTION_CONTEXT_CHARS = 24000
+
+# انواع خطای قابل‌تشخیص در Verify.
+VERIFY_TYPE_SYNTAX = "syntax_error"
+VERIFY_TYPE_MISSING = "missing_file"
+VERIFY_TYPE_CONTENT = "content_mismatch"
+VERIFY_TYPE_BOUNDARY = "boundary"
+VERIFY_TYPE_MUTATION = "mutation_failed"
+VERIFY_TYPE_OTHER = "verify_error"
+
+# استخراج line/column از متن خطای Syntax.
+VERIFY_LINE_PATTERN = re.compile(r"\bline\s+(\d+)", re.IGNORECASE)
+VERIFY_COLUMN_PATTERN = re.compile(r"\bcolumn\s+(\d+)", re.IGNORECASE)
+
 
 def check_python_syntax(full_path):
     # Syntax فقط با py_compile و با همان مفسر پایتونی
@@ -2505,6 +2542,362 @@ def validate_written_file(
     )
 
     return result
+
+
+def _caret_column(message):
+    # خروجی py_compile/node خط منبع را با 4 فاصله تودرتو چاپ
+    # می‌کند و caret (^) را دقیقاً زیر همان خط می‌گذارد.
+    # ستون فقط وقتی گزارش می‌شود که این ساختار دقیقاً برقرار
+    # باشد؛ در غیر این صورت حدس زده نمی‌شود.
+    lines = str(message or "").splitlines()
+
+    for index in range(1, len(lines)):
+        caret_line = lines[index]
+        source_line = lines[index - 1]
+        stripped = caret_line.strip()
+
+        if not stripped or set(stripped) != {"^"}:
+            continue
+
+        if not source_line.startswith("    ") or "\t" in source_line:
+            continue
+
+        caret_at = caret_line.index("^")
+
+        if caret_at < 4 or caret_line[:caret_at].strip():
+            continue
+
+        return caret_at - 3
+
+    return None
+
+
+def parse_syntax_position(message):
+    # استخراج (line, column) از متن خطای Syntax.
+    # هر مقدار که قابل‌اعتماد نباشد None می‌ماند؛ هیچ حدسی
+    # زده نمی‌شود چون Feedback اشتباه بدتر از نبودن آن است.
+    text = "" if message is None else str(message)
+    line = None
+    column = None
+
+    match = VERIFY_LINE_PATTERN.search(text)
+
+    if match:
+        try:
+            line = int(match.group(1))
+
+        except ValueError:
+            line = None
+
+    match = VERIFY_COLUMN_PATTERN.search(text)
+
+    if match:
+        try:
+            column = int(match.group(1))
+
+        except ValueError:
+            column = None
+
+        return line, column
+
+    if line is None:
+        return None, None
+
+    return line, _caret_column(text)
+
+
+def new_verify_error(path, error_type, message, line=None, column=None):
+    # یک خطای Verify ساختاریافته؛ متن خطا Mask و طول آن محدود
+    # می‌شود تا Feedback هرگز بی‌کران نشود.
+    return {
+        "path": "" if path is None else str(path),
+        "error_type": str(error_type),
+        "message": clip_text(
+            mask_sensitive_content(str(message or "")),
+            VERIFY_ERROR_CHARS
+        ),
+        "line": line,
+        "column": column,
+    }
+
+
+def empty_verify_result():
+    # شکل واحد نتیجه Verify.
+    return {
+        "ok": True,
+        "applied": True,
+        "checked": 0,
+        "unchecked": [],
+        "rolled_back": False,
+        "errors": [],
+    }
+
+
+def verify_error_from_validation(relative_path, validation):
+    # تبدیل خروجی موجود validate_written_file به خطای
+    # ساختاریافته. اگر Validation موفق باشد None برمی‌گردد.
+    validation = validation or {}
+
+    if validation.get("valid"):
+        return None
+
+    message = validation.get("error")
+    path = relative_path
+
+    if not validation.get("exists"):
+        error_type = VERIFY_TYPE_MISSING
+
+        if not message:
+            message = "فایل بعد از Write پیدا نشد: " + str(path)
+
+    elif validation.get("syntax_valid") is False:
+        error_type = VERIFY_TYPE_SYNTAX
+
+    elif validation.get("content_matches") is False:
+        error_type = VERIFY_TYPE_CONTENT
+
+    else:
+        error_type = VERIFY_TYPE_OTHER
+
+    if not message:
+        message = "Validation ناموفق بود."
+
+    line = None
+    column = None
+
+    if error_type == VERIFY_TYPE_SYNTAX:
+        line, column = parse_syntax_position(message)
+
+    return new_verify_error(path, error_type, message, line, column)
+
+
+def verify_from_validation(relative_path, validation):
+    # نتیجه Verify برای یک فایل واحد (مسیر write_file).
+    result = empty_verify_result()
+
+    if (validation or {}).get("syntax_checked"):
+        result["checked"] = 1
+
+    else:
+        result["unchecked"] = [str(relative_path)]
+
+    error = verify_error_from_validation(relative_path, validation)
+
+    if error is not None:
+        result["errors"].append(error)
+
+    result["ok"] = not result["errors"]
+
+    return result
+
+
+def verify_from_tool_result(result):
+    # نتیجه Verify ای که خود ابزار Mutation همراه آورده است.
+    data = (result or {}).get("data") or {}
+    verify = data.get("verify")
+
+    if isinstance(verify, dict):
+        return verify
+
+    return None
+
+
+def verify_applied_files(project_root, files):
+    # Verify بعد از یک Mutation موفق.
+    #
+    # فقط می‌خواند و هیچ‌چیز را تغییر نمی‌دهد:
+    # - وجود فایل روی دیسک بعد از Write
+    # - مطابقت محتوا با همان محتوایی که نوشته شد
+    # - Syntax فایل بر اساس نوع فایل، اگر چکر قابل‌اعتمادی
+    #   روی همین سیستم موجود باشد
+    #
+    # اگر برای نوع فایلی چکر قابل‌اعتمادی وجود نداشته باشد،
+    # آن فایل فقط «بررسی‌نشده» گزارش می‌شود و هیچ خطای جعلی
+    # تولید نمی‌شود.
+    result = empty_verify_result()
+
+    for entry in (files or []):
+
+        if not isinstance(entry, dict):
+            continue
+
+        relative_path = str(entry.get("path") or "")
+
+        if not relative_path:
+            result["errors"].append(
+                new_verify_error(
+                    "",
+                    VERIFY_TYPE_OTHER,
+                    "مسیر فایل در Batch نامعتبر است."
+                )
+            )
+
+            continue
+
+        # مرز پروژه و Traversal با همان safe_path کنترل می‌شود.
+        try:
+            checked_path = safe_path(project_root, relative_path)
+
+        except (ValueError, TypeError) as e:
+            result["errors"].append(
+                new_verify_error(
+                    relative_path,
+                    VERIFY_TYPE_BOUNDARY,
+                    str(e)
+                )
+            )
+
+            continue
+
+        try:
+            validation = validate_written_file(
+                project_root,
+                relative_path,
+                entry.get("content"),
+                checked_path
+            )
+
+        except Exception as e:
+            result["errors"].append(
+                new_verify_error(
+                    relative_path,
+                    VERIFY_TYPE_OTHER,
+                    str(e)
+                )
+            )
+
+            continue
+
+        if validation.get("syntax_checked"):
+            result["checked"] += 1
+
+        else:
+            result["unchecked"].append(relative_path)
+
+        error = verify_error_from_validation(
+            relative_path, validation
+        )
+
+        if error is not None:
+            result["errors"].append(error)
+
+    result["ok"] = not result["errors"]
+
+    return result
+
+
+def verify_failed_mutation(mutation_result):
+    # Verify برای Mutation ای که خودش (با Rollback) شکست خورده.
+    #
+    # تغییرات روی دیسک اعمال نشده‌اند، پس محتوای فایل‌ها در
+    # این حالت مقایسه نمی‌شود؛ فقط خطاهای واقعیِ همان تلاش از
+    # نتیجه‌ی write_file_multi استخراج می‌شوند تا به مدل
+    # برگردانده شوند.
+    result = empty_verify_result()
+    result["ok"] = False
+    result["applied"] = False
+    result["rolled_back"] = bool(
+        (mutation_result or {}).get("rolled_back")
+    )
+
+    files = (mutation_result or {}).get("files") or []
+    overall_error = (mutation_result or {}).get("error")
+
+    for item in files:
+
+        if not isinstance(item, dict):
+            continue
+
+        relative_path = str(item.get("relative_path") or "")
+        validation = item.get("validation") or {}
+
+        if validation.get("syntax_checked"):
+            result["checked"] += 1
+
+        elif relative_path:
+            result["unchecked"].append(relative_path)
+
+        error = verify_error_from_validation(
+            relative_path, validation
+        )
+
+        if error is not None:
+            result["errors"].append(error)
+
+    if not result["errors"]:
+        result["errors"].append(
+            new_verify_error(
+                "",
+                VERIFY_TYPE_MUTATION,
+                overall_error or "اجرای Mutation ناموفق بود."
+            )
+        )
+
+    return result
+
+
+def format_verify_feedback(verify, tool_name=None):
+    # Feedback حداقلی برای مدل:
+    # file + error type + message + line/position
+    # ورودی نامعتبر هرگز باعث استثنا نمی‌شود؛ فقط Feedback خالی
+    # تولید می‌شود (هیچ خطای جعلی ساخته نمی‌شود).
+    verify = verify if isinstance(verify, dict) else {}
+    errors = verify.get("errors") or []
+
+    if not isinstance(errors, list):
+        errors = []
+
+    lines = [
+        "VERIFY FAILED"
+        + (" (" + str(tool_name) + ")" if tool_name else "")
+    ]
+
+    if verify.get("rolled_back"):
+        lines.append(
+            "- وضعیت: تغییرات این تلاش Rollback شد و روی دیسک "
+            "اعمال نشده است."
+        )
+
+    elif verify.get("applied") is False:
+        lines.append(
+            "- وضعیت: تغییرات این تلاش روی دیسک اعمال نشده است."
+        )
+
+    for item in errors[:VERIFY_MAX_ERRORS]:
+        if not isinstance(item, dict):
+            continue
+
+        position = []
+
+        if item.get("line") is not None:
+            position.append("line " + str(item.get("line")))
+
+        if item.get("column") is not None:
+            position.append("column " + str(item.get("column")))
+
+        lines.append(
+            "- file: "
+            + (str(item.get("path")) or "?")
+            + " | type: "
+            + str(item.get("error_type"))
+        )
+        lines.append("  error: " + str(item.get("message") or ""))
+
+        if position:
+            lines.append("  " + ", ".join(position))
+
+    remaining = len(errors) - VERIFY_MAX_ERRORS
+
+    if remaining > 0:
+        lines.append(
+            "- " + str(remaining) + " خطای دیگر هم گزارش شد."
+        )
+
+    lines.append(
+        "NOTE: last mutation did NOT pass verification."
+    )
+
+    return clip_text("\n".join(lines), VERIFY_FEEDBACK_CHARS)
 
 
 def call_model(
@@ -8228,6 +8621,12 @@ def tool_write_files(project_root, args):
     per-file transactional backup, atomic writes, post-write validation
     and full rollback if any single file fails. No new write engine is
     introduced here.
+
+    Step 3: the batch is verified AFTER the mutation (read-back +
+    syntax, read-only) and the outcome is reported honestly instead of
+    assuming success. A batch that did not pass verification reports
+    "verified": False plus the structured errors, so the Core can feed
+    them back to the model for exactly one correction.
     """
     files = validate_batch_args(project_root, args)
 
@@ -8241,29 +8640,59 @@ def tool_write_files(project_root, args):
         return tool_fail(e)
 
     if not result.get("success"):
-        return tool_fail(
-            result.get("error") or "Batch ناموفق بود."
-        )
+        # Mutation با Rollback شکست خورد: خطاهای واقعی همان تلاش
+        # استخراج و ساختاریافته به مدل برگردانده می‌شوند.
+        verify = verify_failed_mutation(result)
+
+        return {
+            "ok": False,
+            "verified": False,
+            "text": (
+                "خطا: "
+                + str(result.get("error") or "Batch ناموفق بود.")
+                + "\n"
+                + format_verify_feedback(verify, "write_files")
+            ),
+            "data": {
+                "batch": True,
+                "count": 0,
+                "files": [],
+                "rolled_back": bool(result.get("rolled_back")),
+                "verify": verify,
+            },
+        }
 
     written = [
         item.get("relative_path")
         for item in (result.get("files") or [])
     ]
 
+    # Step 3: Verify بعد از Mutation موفق (فقط خواندن).
+    verify = verify_applied_files(project_root, files)
+    verified = bool(verify.get("ok"))
+
+    text = (
+        "Batch اجرا شد؛ "
+        + str(len(written))
+        + " فایل نوشته شد: "
+        + ", ".join(str(p) for p in written)
+        + " | Verify: "
+        + ("موفق" if verified else "ناموفق")
+    )
+
+    if not verified:
+        text += "\n" + format_verify_feedback(verify, "write_files")
+
     return {
         "ok": True,
-        "verified": True,
-        "text": (
-            "Batch اجرا شد؛ "
-            + str(len(written))
-            + " فایل نوشته شد: "
-            + ", ".join(str(p) for p in written)
-        ),
+        "verified": verified,
+        "text": text,
         "data": {
             "batch": True,
             "count": len(written),
             "files": written,
             "rolled_back": False,
+            "verify": verify,
         },
     }
 
@@ -8291,6 +8720,12 @@ def tool_write_file(project_root, args):
         return tool_fail(e)
 
     validation = details.get("validation") or {}
+    relative_path = details.get("relative_path") or path
+
+    # Step 3: نتیجه Verify همین Mutation به‌صورت ساختاریافته
+    # همراه نتیجه برگردانده می‌شود تا Core بتواند خطای واقعی را
+    # به مدل برگرداند.
+    verify = verify_from_validation(relative_path, validation)
 
     return {
         "ok": True,
@@ -8299,10 +8734,11 @@ def tool_write_file(project_root, args):
             summarize_validation(validation)
         ),
         "data": {
-            "path": details.get("relative_path"),
+            "path": relative_path,
             "backup_path": details.get("backup_path"),
             "diff": details.get("diff"),
             "content_matches": validation.get("content_matches"),
+            "verify": verify,
         },
     }
 
@@ -8337,6 +8773,16 @@ def tool_edit_file(project_root, args):
         if validation else bool(details.get("changed"))
     )
 
+    # Step 3: نتیجه Verify همین Edit به‌صورت ساختاریافته برگردانده
+    # می‌شود (همان Validation موجود). اگر Validation در دسترس نباشد
+    # هیچ ادعایی ساخته نمی‌شود و Verify خالی می‌ماند.
+    verify = (
+        verify_from_validation(
+            details.get("relative_path") or path, validation
+        )
+        if validation else None
+    )
+
     lines = summarize_validation(validation)
     lines.append(
         "تعداد جایگزینی: "
@@ -8351,6 +8797,7 @@ def tool_edit_file(project_root, args):
             "path": details.get("relative_path"),
             "backup_path": details.get("backup_path"),
             "diff": details.get("diff"),
+            "verify": verify,
         },
     }
 
@@ -8685,6 +9132,22 @@ def primary_target(tool_name, args):
         return str(
             tool_arg(args, "source", "from", "path", "old") or ""
         )
+
+    if tool_name == "write_files":
+        # Step 3: یک «گام اصلاحی» برای Batch فقط وقتی همان
+        # مجموعه مسیرهاست. Batch با مسیرهای جدید یک Plan جدید
+        # است و باید از مسیر عادی Approval/Re-validation بگذرد،
+        # نه از مسیر گام اصلاحی.
+        try:
+            paths = sorted(
+                str(item.get("path"))
+                for item in normalize_batch_files(args)
+            )
+
+        except Exception:
+            return ""
+
+        return "|".join(paths)[:500]
 
     return str(
         tool_arg(args, "path", "relative_path", "file", "dir") or ""
@@ -9120,6 +9583,21 @@ def build_loop_user_prompt(
     last = last_mutating_entry(transcript)
 
     if last is not None and last.get("verified") is False:
+        # Step 3: خطای واقعی Verify به مدل برگردانده می‌شود
+        # (فایل + نوع خطا + پیام + line/position). اگر جزئیات
+        # ساختاریافته‌ای موجود نباشد، فقط همان هشدار قبلی
+        # نوشته می‌شود و هیچ خطایی ساخته نمی‌شود.
+        last_verify = last.get("verify")
+
+        if isinstance(last_verify, dict) and last_verify.get("errors"):
+            parts.append(
+                format_verify_feedback(
+                    last_verify, last.get("tool")
+                )
+            )
+
+            parts.append("")
+
         if correction_attempts < MAX_CORRECTION_STEPS:
             parts.append(
                 "NOTE: the last change FAILED verification. "
@@ -10537,6 +11015,11 @@ def run_loop_steps(
                             if isinstance(autonomous_result, dict)
                             else None
                         ),
+                        # Step 3: جزئیات ساختاریافته Verify برای
+                        # Error Feedback در گام اصلاحی.
+                        "verify": verify_from_tool_result(
+                            autonomous_result
+                        ),
                         "autonomous": True,
                     }
 
@@ -10618,6 +11101,12 @@ def run_loop_steps(
             "mutating": bool(spec["mutating"]),
             "verified": (
                 result.get("verified")
+                if spec["mutating"] else None
+            ),
+            # Step 3: جزئیات ساختاریافته Verify برای Error Feedback
+            # در گام اصلاحی.
+            "verify": (
+                verify_from_tool_result(result)
                 if spec["mutating"] else None
             ),
         }
@@ -10805,6 +11294,9 @@ def execute_pending_action(stop_event=None):
         "result": result,
         "mutating": True,
         "verified": result.get("verified"),
+        # Step 3: جزئیات ساختاریافته Verify برای Error Feedback
+        # در گام اصلاحی.
+        "verify": verify_from_tool_result(result),
     }
 
     observation = format_observation(
@@ -10892,13 +11384,154 @@ def should_use_agentic_loop(user_request, project_root):
     return False
 
 
+# Step 3 — Correction.
+#
+# مدل فقط یک فرصت اصلاح دارد (MAX_CORRECTION_STEPS). Proposal
+# اصلاحی از همان Proposal Contract عادی عبور می‌کند؛ هیچ مسیر
+# مستقیمی به نوشتن فایل وجود ندارد.
+CORRECTION_SYSTEM_PROMPT = (
+    "You repair ONE failed change and nothing else.\n"
+    "Answer with exactly one line:\n"
+    'BATCH_PROPOSAL: {"files": [{"path": "<relative path>", '
+    '"content": "<FULL corrected file content>"}]}\n'
+    "Rules: only the files listed in the feedback; content must be "
+    "the COMPLETE file; change only what the verification error "
+    "describes; no markdown, no commentary, no extra text."
+)
+
+
+def correction_context_files(
+    proposal_files,
+    verify,
+    limit=MAX_CORRECTION_FILES
+):
+    # فقط فایل‌هایی که Verify آن‌ها شکست خورده به مدل داده
+    # می‌شوند. فایل‌های سالم و بقیه پروژه دوباره فرستاده
+    # نمی‌شوند (Minimal Error Context).
+    paths = []
+
+    for error in (verify or {}).get("errors") or []:
+        path = str(error.get("path") or "")
+
+        if path and path not in paths:
+            paths.append(path)
+
+    if not paths or len(paths) > limit:
+        return []
+
+    allowed = set(paths)
+
+    return [
+        item for item in (proposal_files or [])
+        if isinstance(item, dict)
+        and str(item.get("path")) in allowed
+    ]
+
+
+def build_correction_prompt(
+    feedback,
+    files,
+    user_request="",
+    project_name=None
+):
+    # Context حداقلی برای یک فرصت اصلاح.
+    #
+    # متن هر فایل باید کامل باشد، چون Proposal Contract کل فایل
+    # را می‌نویسد؛ اگر همین context حداقلی جا نشود، هیچ اصلاحی
+    # انجام نمی‌شود (Fail Closed) تا هرگز فایل ناقص نوشته نشود.
+    entries = [
+        item for item in (files or [])
+        if isinstance(item, dict) and item.get("path") is not None
+    ]
+
+    if not entries or len(entries) > MAX_CORRECTION_FILES:
+        return None
+
+    total = 0
+    blocks = []
+
+    for item in entries:
+        content = str(item.get("content") or "")
+        total += len(content)
+
+        if total > MAX_CORRECTION_CONTEXT_CHARS:
+            return None
+
+        blocks.append(
+            "BEGIN_FILE " + str(item.get("path")) + "\n"
+            + content + "\nEND_FILE " + str(item.get("path"))
+        )
+
+    return "\n".join([
+        "PROJECT: " + str(project_name or ""),
+        "CURRENT REQUEST: " + str(user_request or ""),
+        "",
+        "VERIFY FEEDBACK (the previous attempt was NOT verified):",
+        str(feedback or ""),
+        "",
+        "FILES TO CORRECT (current content):",
+        "\n".join(blocks),
+        "",
+        "Return BATCH_PROPOSAL JSON with the corrected FULL "
+        "content of these files only.",
+    ])
+
+
+def request_corrected_proposal(
+    feedback,
+    files,
+    project_name=None,
+    project_root=None,
+    user_request="",
+    stop_event=None
+):
+    # یک فرصت اصلاح: Model → Proposal Contract.
+    #
+    # این تابع فقط یک Proposal برمی‌گرداند. هیچ ابزاری اجرا
+    # نمی‌شود، هیچ فایلی نوشته نمی‌شود و هیچ تصمیمی درباره‌ی
+    # مسیر/مجوز گرفته نمی‌شود؛ اعتبار و امنیت Proposal کاملاً
+    # در اختیار Safety Layer است (همان مسیر Proposal عادی).
+    if is_stop_requested(stop_event):
+        return None
+
+    prompt = build_correction_prompt(
+        feedback, files, user_request, project_name
+    )
+
+    if not prompt:
+        return None
+
+    try:
+        answer = call_model(
+            CORRECTION_SYSTEM_PROMPT,
+            prompt,
+            stop_event=stop_event,
+            n_predict=LOOP_MODEL_N_PREDICT,
+            no_think=True,
+        )
+
+    except Exception:
+        return None
+
+    try:
+        # Proposal Contract تنها یک Parser دارد (Step 2).
+        from agents.orchestrator import extract_agent_proposal
+
+    except Exception:
+        return None
+
+    return extract_agent_proposal(answer)
+
+
 def handle_agent_batch_proposal(
     proposal,
     project_name,
     project_root,
     user_request,
     allow_write=False,
-    stop_event=None
+    stop_event=None,
+    correction_attempts=0,
+    proposal_source=None
 ):
     """
     Step 2: run an agent's PROPOSAL through the existing Step 1 batch path.
@@ -10921,157 +11554,278 @@ def handle_agent_batch_proposal(
     It does not touch Emergency Stop, Re-validation, Approval Gate,
     write_file_multi, backup/undo or the journal implementations; it only
     calls them in the same order the agentic loop already uses.
+
+    Step 3 addition: after a successful execution the batch is VERIFIED
+    (read-back + syntax, read-only). If that verification fails, the real
+    error (file + type + message + line/position) is handed back to the
+    model for exactly ONE correction (MAX_CORRECTION_STEPS), and the
+    corrected proposal re-enters this same loop, so it passes through
+    every safety layer again: validation, project boundary, write
+    permission, approval/autonomous, Emergency Stop, Re-validation,
+    atomic write, journal and Verify. A second failure stops execution.
     """
-    if not proposal:
-        return None
+    # تلاش صفر = Proposal اصلی. هر گام اصلاحی از همان ابتدای همین
+    # حلقه عبور میکند، پس هیچ Safety Layer ای دور زده نمیشود.
+    if isinstance(correction_attempts, int) and correction_attempts > 0:
+        attempts_used = correction_attempts
 
-    # Fail closed on a malformed proposal before anything else happens.
-    try:
-        proposal_args = {"files": proposal.get("files") or []}
+    elif correction_attempts in (0, None):
+        attempts_used = 0
 
-    except Exception:
-        return build_report(
-            "Agent Proposal",
-            project_name,
-            project_root,
-            ["پیشنهاد Agent نامعتبر بود؛ هیچ تغییری انجام نشد."]
+    else:
+        # مقدار نامعتبر → هیچ فرصت اصلاحی (Fail Closed).
+        attempts_used = MAX_CORRECTION_STEPS
+
+    entries = []
+    current = proposal
+
+    while True:
+        if not current:
+            return None
+
+        # Fail closed on a malformed proposal before anything else happens.
+        try:
+            proposal_args = {"files": current.get("files") or []}
+
+        except Exception:
+            return build_report(
+                "Agent Proposal",
+                project_name,
+                project_root,
+                ["پیشنهاد Agent نامعتبر بود؛ هیچ تغییری انجام نشد."]
+            )
+
+        # validate_batch_args raises on any invalid member or any path
+        # outside the project root, which rejects the WHOLE batch.
+        try:
+            proposal_args = {"files": validate_batch_args(
+                project_root, proposal_args
+            )}
+
+        except Exception as e:
+            return build_report(
+                "Agent Proposal",
+                project_name,
+                project_root,
+                [
+                    "پیشنهاد Agent معتبر نبود؛ هیچ تغییری انجام نشد.",
+                    str(e)[:200],
+                ]
+            )
+
+        if not is_write_allowed(allow_write):
+            return build_report(
+                "Agent Proposal",
+                project_name,
+                project_root,
+                [
+                    "پیشنهاد Agent در حالت «فقط بررسی» اجرا نمیشود؛ "
+                    "هیچ تغییری انجام نشد."
+                ]
+            )
+
+        tool_name = "write_files"
+
+        # Emergency Stop before creating any plan or writing anything.
+        if is_stop_requested(stop_event):
+            return build_emergency_stop_report(
+                "Emergency Stop",
+                project_name,
+                project_root,
+                notes=[
+                    "پیشنهاد Agent اجرا نشد؛ "
+                    "هیچ Step/ابزاری اجرا نشد.",
+                ]
+            )
+
+        plan_text = build_pending_plan_text(
+            tool_name, proposal_args, project_root,
+            write_mode=allow_write
         )
 
-    # validate_batch_args raises on any invalid member or any path outside
-    # the project root, which rejects the WHOLE batch.
-    try:
-        proposal_args = {"files": validate_batch_args(
-            project_root, proposal_args
-        )}
+        pending_action = {
+            "tool": tool_name,
+            "args": proposal_args,
+            "project": project_name,
+            "project_root": project_root,
+            "user_request": user_request,
+            "context": build_pending_revalidation_context(
+                tool_name,
+                proposal_args,
+                project_root,
+                project_name,
+                allow_write=allow_write,
+            ),
+        }
 
-    except Exception as e:
-        return build_report(
-            "Agent Proposal",
-            project_name,
-            project_root,
-            [
-                "پیشنهاد Agent معتبر نبود؛ هیچ تغییری انجام نشد.",
-                str(e)[:200],
-            ]
+        # Manual: ONE approval for the entire batch, exactly like Step 1.
+        # A correction is never a shortcut: it enters this same gate.
+        if not is_autonomous_project(project_name):
+            remember_pending_action(pending_action)
+
+            return build_loop_report(
+                project_name,
+                project_root,
+                entries,
+                pending_plan=plan_text,
+                notes=[
+                    "Agent فقط پیشنهاد داد؛ هیچ تغییری هنوز روی دیسک "
+                    "انجام نشده است. برای اجرای کل Batch یک بار تأیید کنید."
+                ]
+            )
+
+        # Autonomous: approval is skipped, every other safety layer is not.
+        ok, reason, context = revalidate_pending_action(pending_action)
+
+        if not ok:
+            remember_revalidation_failure(pending_action, context, reason)
+
+            return build_loop_report(
+                project_name,
+                project_root,
+                entries,
+                notes=[
+                    "Re-validation ناموفق بود؛ هیچ فایلی نوشته نشد.",
+                    str(reason)[:200],
+                ]
+            )
+
+        # Emergency Stop may have been triggered while re-validating.
+        if is_stop_requested(stop_event):
+            return build_emergency_stop_report(
+                "Emergency Stop",
+                project_name,
+                project_root,
+                notes=["پیشنهاد Agent اجرا نشد؛ هیچ تغییری انجام نشد."]
+            )
+
+        result = tool_write_files(project_root, proposal_args)
+
+        # Step 3: نتیجه Verify بعد از Mutation. ابزار همان Verify
+        # محدود (read-back + syntax) را خودش انجام داده است.
+        verify = verify_from_tool_result(result)
+
+        if verify is None:
+            # مسیر دفاعی: اگر ابزار نتیجه Verify نداده باشد، اینجا
+            # انجام میشود؛ هیچ فرضی درباره موفقیت گرفته نمیشود.
+            if result.get("ok"):
+                verify = verify_applied_files(
+                    project_root, proposal_args.get("files") or []
+                )
+
+            else:
+                verify = verify_failed_mutation({})
+
+        verified_ok = (
+            bool(result.get("ok"))
+            and bool(verify.get("ok"))
+            and result.get("verified") is not False
         )
 
-    if not is_write_allowed(allow_write):
-        return build_report(
-            "Agent Proposal",
-            project_name,
-            project_root,
-            [
-                "پیشنهاد Agent در حالت «فقط بررسی» اجرا نمی‌شود؛ "
-                "هیچ تغییری انجام نشد."
-            ]
+        # Journal وضعیت واقعی را ثبت میکند: اجرا + نتیجه Verify.
+        record_action(
+            "multi_write",
+            operation_class=ACTION_CLASS_USER,
+            tool=tool_name,
+            args=proposal_args,
+            project=project_name,
+            project_root=project_root,
+            approval_state=ACTION_APPROVAL_APPROVED,
+            validation_state=bool(verified_ok),
+            execution_state=(
+                ACTION_STATE_DONE
+                if result.get("ok") else ACTION_STATE_FAILED
+            ),
+            verify_state=verify_state_from_bool(verified_ok),
+            result_summary=summarize_action_result(
+                "agent batch proposal executed; verify="
+                + ("ok" if verified_ok else "failed")
+            ),
         )
 
-    tool_name = "write_files"
-
-    # Emergency Stop before creating any plan or writing anything.
-    if is_stop_requested(stop_event):
-        return build_emergency_stop_report(
-            "Emergency Stop",
-            project_name,
-            project_root,
-            notes=[
-                "پیشنهاد Agent اجرا نشد؛ "
-                "هیچ Step/ابزاری اجرا نشد.",
-            ]
-        )
-
-    plan_text = build_pending_plan_text(
-        tool_name, proposal_args, project_root,
-        write_mode=allow_write
-    )
-
-    pending_action = {
-        "tool": tool_name,
-        "args": proposal_args,
-        "project": project_name,
-        "project_root": project_root,
-        "user_request": user_request,
-        "context": build_pending_revalidation_context(
-            tool_name,
-            proposal_args,
-            project_root,
-            project_name,
-            allow_write=allow_write,
-        ),
-    }
-
-    # Manual: ONE approval for the entire batch, exactly like Step 1.
-    if not is_autonomous_project(project_name):
-        remember_pending_action(pending_action)
-
-        return build_loop_report(
-            project_name,
-            project_root,
-            [],
-            pending_plan=plan_text,
-            notes=[
-                "Agent فقط پیشنهاد داد؛ هیچ تغییری هنوز روی دیسک "
-                "انجام نشده است. برای اجرای کل Batch یک بار تأیید کنید."
-            ]
-        )
-
-    # Autonomous: approval is skipped, every other safety layer is not.
-    ok, reason, context = revalidate_pending_action(pending_action)
-
-    if not ok:
-        remember_revalidation_failure(pending_action, context, reason)
-
-        return build_loop_report(
-            project_name,
-            project_root,
-            [],
-            notes=[
-                "Re-validation ناموفق بود؛ هیچ فایلی نوشته نشد.",
-                str(reason)[:200],
-            ]
-        )
-
-    # Emergency Stop may have been triggered while re-validating.
-    if is_stop_requested(stop_event):
-        return build_emergency_stop_report(
-            "Emergency Stop",
-            project_name,
-            project_root,
-            notes=["پیشنهاد Agent اجرا نشد؛ هیچ تغییری انجام نشد."]
-        )
-
-    result = tool_write_files(project_root, proposal_args)
-
-    record_action(
-        "multi_write",
-        operation_class=ACTION_CLASS_USER,
-        tool=tool_name,
-        args=proposal_args,
-        project=project_name,
-        project_root=project_root,
-        approval_state=ACTION_APPROVAL_APPROVED,
-        execution_state=(
-            ACTION_STATE_DONE
-            if result.get("ok") else ACTION_STATE_FAILED
-        ),
-        result_summary=summarize_action_result(
-            "agent batch proposal executed"
-        ),
-    )
-
-    return build_loop_report(
-        project_name,
-        project_root,
-        [{
-            "step": 1,
+        entry = {
+            "step": len(entries) + 1,
             "tool": tool_name,
             "args": proposal_args,
             "result": result,
             "mutating": True,
             "verified": result.get("verified"),
-        }],
-        final_answer=str(result.get("text") or ""),
-    )
+            "verify": verify,
+        }
+
+        entries = entries + [entry]
+
+        if verified_ok:
+            return build_loop_report(
+                project_name,
+                project_root,
+                entries,
+                final_answer=str(result.get("text") or ""),
+            )
+
+        # Step 3: Error Feedback (فایل + نوع خطا + پیام + line/position).
+        feedback = format_verify_feedback(verify, tool_name)
+
+        # فقط یک گام اصلاحی؛ همان ثابت موجود در Core Loop.
+        if attempts_used >= MAX_CORRECTION_STEPS:
+            return build_loop_report(
+                project_name,
+                project_root,
+                entries,
+                notes=[
+                    "Verify ناموفق بود و سقف گام اصلاحی ("
+                    + str(MAX_CORRECTION_STEPS)
+                    + ") پر شده است؛ اجرا متوقف شد.",
+                    feedback,
+                ]
+            )
+
+        source = proposal_source or request_corrected_proposal
+
+        try:
+            corrected = source(
+                feedback,
+                correction_context_files(
+                    proposal_args.get("files") or [], verify
+                ),
+                project_name=project_name,
+                project_root=project_root,
+                user_request=user_request,
+                stop_event=stop_event,
+            )
+
+        except Exception:
+            corrected = None
+
+        if not corrected:
+            # Proposal اصلاحی نداریم → هیچ تغییر جدیدی اجرا نمیشود.
+            return build_loop_report(
+                project_name,
+                project_root,
+                entries,
+                notes=[
+                    "Proposal اصلاحی معتبری تولید نشد؛ هیچ تغییر "
+                    "جدیدی اجرا نشد.",
+                    feedback,
+                ]
+            )
+
+        if is_stop_requested(stop_event):
+            return build_emergency_stop_report(
+                "Emergency Stop",
+                project_name,
+                project_root,
+                notes=[
+                    "گام اصلاحی اجرا نشد؛ حالت اضطراری فعال است."
+                ]
+            )
+
+        attempts_used += 1
+        current = corrected
+
+        # برگشت به ابتدای همین حلقه: Proposal اصلاحی دقیقاً از همان
+        # مسیر عبور میکند (validate → permission → approval/
+        # autonomous → Stop → Re-validation → write → journal → Verify).
 
 
 def run_agent(
