@@ -298,9 +298,14 @@ class ResearchAgent(Agent):
 
         return "\n".join(lines)
 
-    def _extract_explicit_search_phrase(self, user_request: str) -> str:
+    @staticmethod
+    def _extract_explicit_search_phrase(user_request: str) -> str:
         """
         Return the first explicitly delimited search phrase, or "".
+
+        Phase 9 Section 2C: this is a @staticmethod so SeniorAgent can reuse
+        this exact detection for routing without instantiating an agent and
+        without adding a second, independent search-phrase parser.
 
         Only "..." , `...` and «...» count as an explicit phrase. Two guards
         keep this from hijacking the existing explicit-file path:

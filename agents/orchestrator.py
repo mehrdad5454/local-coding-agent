@@ -183,6 +183,19 @@ class SeniorAgent(Agent):
             if trigger.lower() in request_lower:
                 return True
 
+        # Phase 9 Section 2C: an explicit, delimited search phrase
+        # ("...", `...`, «...») is by itself a research request, so the
+        # Section 2B search capability is actually reachable. This reuses
+        # ResearchAgent's own detection (no second parser) and adds NO
+        # generic search keyword: without a delimited phrase nothing here
+        # matches, so no project scan can ever be triggered by free text.
+        #
+        # Marketing is still checked first (unchanged), and this branch runs
+        # before the opportunity check and before the skeleton fallback, so an
+        # explicit search can never be swallowed by the generic route.
+        if ResearchAgent._extract_explicit_search_phrase(user_request):
+            return True
+
         return False
 
     def _is_opportunity_request(self, user_request: str) -> bool:
