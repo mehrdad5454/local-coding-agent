@@ -30,9 +30,11 @@ Phase 6: SeniorAgent now acts as a gatekeeper:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import json
+import re
+from typing import Any, Dict, List, Optional
 
-from .base import Agent
+from .base import Agent, MUTATION_TOOL_NAMES
 from .marketing import MarketingAgent
 from .research import ResearchAgent
 from .opportunity import OpportunityAgent
@@ -44,6 +46,136 @@ from .permissions import (
 
 # Phase 7: Persona layer
 from .persona import PersonaRegistry, create_default_registry
+
+
+# Step 2 — Agent Proposal Contract.
+#
+# A specialized agent is "Analyze -> Propose". It NEVER writes and NEVER
+# executes a tool that mutates. The only thing it may return instead of a
+# plain answer is a PROPOSAL, in exactly this shape:
+#
+#   {"files": [{"path": "<relative path>", "content": "<full content>"}]}
+#
+# That shape is deliberately identical to the arguments of the existing
+# `write_files` tool, so the Core Loop can feed a proposal into the Step 1
+# batch path (validate_batch_args -> approval/autonomous -> Re-validation
+# -> write_file_multi) without translating or re-implementing anything.
+#
+# Nothing is invented: a proposal exists only if the agent actually
+# emitted this JSON. Everything else is treated as ordinary text.
+PROPOSAL_KEY = "files"
+MAX_PROPOSAL_FILES = 20
+MAX_PROPOSAL_CONTENT_CHARS = 300 * 1024
+
+# Step 2 — Mutation Boundary.
+#
+# The tool names live in agents/base.py (a plain constant, no dependencies)
+# and are imported here so there is exactly one source of truth. They must
+# never reach a specialized agent: the Core Loop in agent.py remains the
+# single owner of every real mutation.
+
+
+def strip_mutation_tools(tools):
+    """
+    Return a copy of `tools` with every mutation/command tool removed.
+
+    Used by SeniorAgent so the boundary is enforced at the point where the
+    agent is built, regardless of what the caller passed in. Read-only and
+    control tools (call_model, read_file, safe_path, search_in_files,
+    record_action, is_stop_requested, is_write_allowed, ...) are kept.
+    """
+    if not tools:
+        return {}
+
+    return {
+        name: tool
+        for name, tool in tools.items()
+        if name not in MUTATION_TOOL_NAMES
+    }
+
+
+def extract_agent_proposal(text):
+    """
+    Return {"files": [...]} when an agent emitted a valid proposal.
+
+    Returns None for ordinary prose. Fails closed: anything ambiguous,
+    oversized, malformed, or without a usable path/content is rejected
+    rather than guessed. This function performs no filesystem access and
+    no project-boundary decision — validation of the paths belongs to the
+    Core Loop's validate_batch_args.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    candidates = []
+
+    # Explicit, self-describing tag first (what the prompt asks for).
+    for match in re.finditer(
+        r"(?is)BATCH_PROPOSAL\s*[:\-]?\s*(\{.*?\})\s*(?:\n|$)", text
+    ):
+        candidates.append(match.group(1))
+
+    # Otherwise: every well-formed JSON object in the text.
+    candidates.extend(re.findall(r"(?s)\{.*?\}", text))
+
+    for raw in candidates:
+        try:
+            payload = json.loads(raw)
+
+        except Exception:
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        files = payload.get(PROPOSAL_KEY)
+
+        if not isinstance(files, list) or not files:
+            continue
+
+        if len(files) > MAX_PROPOSAL_FILES:
+            continue
+
+        normalized = []
+
+        for item in files:
+            if not isinstance(item, dict):
+                normalized = []
+                break
+
+            path = (
+                item.get("path")
+                or item.get("relative_path")
+                or item.get("file")
+            )
+            content = item.get("content")
+
+            if content is None:
+                content = item.get("text")
+
+            if not path or not isinstance(path, str):
+                normalized = []
+                break
+
+            if content is None or not isinstance(content, str):
+                normalized = []
+                break
+
+            if len(content) > MAX_PROPOSAL_CONTENT_CHARS:
+                normalized = []
+                break
+
+            normalized.append({
+                "path": path,
+                "content": content,
+            })
+
+        if not normalized:
+            continue
+
+        return {PROPOSAL_KEY: normalized}
+
+    return None
 
 
 class SeniorAgent(Agent):
@@ -62,6 +194,16 @@ class SeniorAgent(Agent):
         stop_event=None,
         persona_registry: Optional[PersonaRegistry] = None,
     ):
+        # Step 2 — Mutation Boundary (defense in depth).
+        #
+        # Multi-Agent is "Analyze -> Propose" and nothing else. Any mutation
+        # or command-execution tool is stripped here, so no future caller can
+        # reintroduce a write path into an agent. Execution of changes belongs
+        # exclusively to the Core Loop in agent.py, which keeps Emergency
+        # Stop, Re-validation, Approval/Autonomous, backup/undo and the
+        # journal in one place.
+        tools = strip_mutation_tools(tools)
+
         super().__init__(
             name="senior_agent",
             tools=tools,
@@ -144,6 +286,32 @@ class SeniorAgent(Agent):
             project_root=project_root,
             allow_write=allow_write,
         )
+
+    def propose(self, task: str, **kwargs):
+        """
+        Step 2: run the normal routing, then separate PROPOSAL from ANSWER.
+
+        Returns (answer_text, proposal_or_None) where proposal has exactly
+        the shape the Core Loop's `write_files` tool expects:
+        {"files": [{"path": ..., "content": ...}]}.
+
+        The agent still never executes anything. Validation, approval and
+        execution stay in the Core Loop. If the delegated agent fails,
+        the failure is contained here: no proposal is returned, so no
+        mutation can result, and the caller falls back to its normal path.
+        """
+        try:
+            answer = self.run(task, **kwargs)
+
+        except Exception:
+            # Agent failure must never produce a proposal and therefore
+            # never produce a mutation.
+            return None, None
+
+        if not isinstance(answer, str):
+            return answer, None
+
+        return answer, extract_agent_proposal(answer)
 
     def _is_stopped(self, stop_event) -> bool:
         """Check if the shared stop_event is set."""

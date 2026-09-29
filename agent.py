@@ -10892,6 +10892,188 @@ def should_use_agentic_loop(user_request, project_root):
     return False
 
 
+def handle_agent_batch_proposal(
+    proposal,
+    project_name,
+    project_root,
+    user_request,
+    allow_write=False,
+    stop_event=None
+):
+    """
+    Step 2: run an agent's PROPOSAL through the existing Step 1 batch path.
+
+    A specialized agent may only propose. This function is the only place
+    where a proposal becomes a real change, and it deliberately reuses the
+    Core machinery instead of re-implementing any of it:
+
+        proposal
+          -> validate_batch_args()          (fails closed; project boundary)
+          -> is_write_allowed()            (read-only mode still blocks)
+          -> approval_mode
+               manual     -> ONE pending action for the whole batch
+               autonomous -> revalidate -> execute, no prompt
+          -> Emergency Stop
+          -> revalidate_pending_action()   (fail closed)
+          -> tool_write_files() -> write_file_multi (atomic, backup, undo)
+          -> record_action()               (journal)
+
+    It does not touch Emergency Stop, Re-validation, Approval Gate,
+    write_file_multi, backup/undo or the journal implementations; it only
+    calls them in the same order the agentic loop already uses.
+    """
+    if not proposal:
+        return None
+
+    # Fail closed on a malformed proposal before anything else happens.
+    try:
+        proposal_args = {"files": proposal.get("files") or []}
+
+    except Exception:
+        return build_report(
+            "Agent Proposal",
+            project_name,
+            project_root,
+            ["پیشنهاد Agent نامعتبر بود؛ هیچ تغییری انجام نشد."]
+        )
+
+    # validate_batch_args raises on any invalid member or any path outside
+    # the project root, which rejects the WHOLE batch.
+    try:
+        proposal_args = {"files": validate_batch_args(
+            project_root, proposal_args
+        )}
+
+    except Exception as e:
+        return build_report(
+            "Agent Proposal",
+            project_name,
+            project_root,
+            [
+                "پیشنهاد Agent معتبر نبود؛ هیچ تغییری انجام نشد.",
+                str(e)[:200],
+            ]
+        )
+
+    if not is_write_allowed(allow_write):
+        return build_report(
+            "Agent Proposal",
+            project_name,
+            project_root,
+            [
+                "پیشنهاد Agent در حالت «فقط بررسی» اجرا نمی‌شود؛ "
+                "هیچ تغییری انجام نشد."
+            ]
+        )
+
+    tool_name = "write_files"
+
+    # Emergency Stop before creating any plan or writing anything.
+    if is_stop_requested(stop_event):
+        return build_emergency_stop_report(
+            "Emergency Stop",
+            project_name,
+            project_root,
+            notes=[
+                "پیشنهاد Agent اجرا نشد؛ "
+                "هیچ Step/ابزاری اجرا نشد.",
+            ]
+        )
+
+    plan_text = build_pending_plan_text(
+        tool_name, proposal_args, project_root,
+        write_mode=allow_write
+    )
+
+    pending_action = {
+        "tool": tool_name,
+        "args": proposal_args,
+        "project": project_name,
+        "project_root": project_root,
+        "user_request": user_request,
+        "context": build_pending_revalidation_context(
+            tool_name,
+            proposal_args,
+            project_root,
+            project_name,
+            allow_write=allow_write,
+        ),
+    }
+
+    # Manual: ONE approval for the entire batch, exactly like Step 1.
+    if not is_autonomous_project(project_name):
+        remember_pending_action(pending_action)
+
+        return build_loop_report(
+            project_name,
+            project_root,
+            [],
+            pending_plan=plan_text,
+            notes=[
+                "Agent فقط پیشنهاد داد؛ هیچ تغییری هنوز روی دیسک "
+                "انجام نشده است. برای اجرای کل Batch یک بار تأیید کنید."
+            ]
+        )
+
+    # Autonomous: approval is skipped, every other safety layer is not.
+    ok, reason, context = revalidate_pending_action(pending_action)
+
+    if not ok:
+        remember_revalidation_failure(pending_action, context, reason)
+
+        return build_loop_report(
+            project_name,
+            project_root,
+            [],
+            notes=[
+                "Re-validation ناموفق بود؛ هیچ فایلی نوشته نشد.",
+                str(reason)[:200],
+            ]
+        )
+
+    # Emergency Stop may have been triggered while re-validating.
+    if is_stop_requested(stop_event):
+        return build_emergency_stop_report(
+            "Emergency Stop",
+            project_name,
+            project_root,
+            notes=["پیشنهاد Agent اجرا نشد؛ هیچ تغییری انجام نشد."]
+        )
+
+    result = tool_write_files(project_root, proposal_args)
+
+    record_action(
+        "multi_write",
+        operation_class=ACTION_CLASS_USER,
+        tool=tool_name,
+        args=proposal_args,
+        project=project_name,
+        project_root=project_root,
+        approval_state=ACTION_APPROVAL_APPROVED,
+        execution_state=(
+            ACTION_STATE_DONE
+            if result.get("ok") else ACTION_STATE_FAILED
+        ),
+        result_summary=summarize_action_result(
+            "agent batch proposal executed"
+        ),
+    )
+
+    return build_loop_report(
+        project_name,
+        project_root,
+        [{
+            "step": 1,
+            "tool": tool_name,
+            "args": proposal_args,
+            "result": result,
+            "mutating": True,
+            "verified": result.get("verified"),
+        }],
+        final_answer=str(result.get("text") or ""),
+    )
+
+
 def run_agent(
     user_request,
     project_name,
@@ -10954,6 +11136,14 @@ def run_agent(
             # Phase 2: Multi-Agent integration.
             # When use_multi_agent is True, delegate to SeniorAgent
             # before falling through to agentic_loop / legacy path.
+            #
+            # Step 2: Multi-Agent is Analyze -> Propose only. SeniorAgent
+            # holds no mutation/command tool, so it cannot change anything
+            # by itself. If it proposed a batch, that proposal is handed to
+            # handle_agent_batch_proposal(), which runs it through the very
+            # same Core batch path used by the agentic loop (validate ->
+            # approval/autonomous -> re-validation -> write_file_multi ->
+            # journal). Nothing here bypasses Emergency Stop.
             if use_multi_agent:
                 try:
                     from agents.orchestrator import SeniorAgent
@@ -10975,13 +11165,37 @@ def run_agent(
                         stop_event=stop_event,
                     )
 
-                    senior_result = senior.run(
+                    senior_result, agent_proposal = senior.propose(
                         user_request,
                         project_name=project_name,
                         project_root=project_root,
                         allow_write=allow_write,
                         stop_event=stop_event,
                     )
+
+                    if agent_proposal:
+                        # A proposal never executes here; the Core does.
+                        proposal_result = handle_agent_batch_proposal(
+                            agent_proposal,
+                            project_name=project_name,
+                            project_root=project_root,
+                            user_request=user_request,
+                            allow_write=allow_write,
+                            stop_event=stop_event,
+                        )
+
+                        remember_conversation_message(
+                            "agent", proposal_result, project_name
+                        )
+
+                        return proposal_result
+
+                    if senior_result is None:
+                        # Agent failed. Fall through to the normal paths
+                        # instead of returning anything.
+                        raise RuntimeError(
+                            "SeniorAgent produced no result"
+                        )
 
                     remember_conversation_message(
                         "agent", senior_result, project_name

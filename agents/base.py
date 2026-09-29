@@ -26,6 +26,28 @@ from .permissions import AgentPermissionModel
 from .persona import Persona, PersonaRegistry
 
 
+# Step 2 — Mutation Boundary.
+#
+# A plain tuple with no dependencies, defined here (the lowest layer of the
+# agent package) so that agents/orchestrator.py can import it instead of
+# defining its own copy — one single source of truth, no circular import.
+#
+# Multi-Agent is "Analyze -> Propose". These are the mutation/command tools
+# of Step 2 and they must never reach a specialized agent: the Core Loop in
+# agent.py remains the single owner of every real mutation.
+#
+# Note: the legacy tool registry in agent.py also exposes edit_file,
+# create_directory, move_entry and delete_entry. They are intentionally not
+# part of this tuple: no code path passes them to an agent (agent.py hands
+# agents only read-only/control tools), so they cannot reach one today.
+MUTATION_TOOL_NAMES = (
+    "write_file",
+    "write_files",
+    "write_file_multi",
+    "run_command",
+)
+
+
 class Agent(ABC):
     """
     Abstract base class for all agents in the multi-agent system.
@@ -94,12 +116,35 @@ class Agent(ABC):
 
         Raises KeyError if the tool is not available, or PermissionError
         if the agent's permission model restricts it.
+
+        Step 2 — Mutation Boundary: this is the single choke point every
+        agent uses to reach a tool, so it is also where the boundary is
+        enforced last. Even if a mutation tool were somehow present in
+        `self.tools`, no agent may obtain it through here. Execution of
+        real changes belongs exclusively to the Core Loop in agent.py.
         """
+        if tool_name in MUTATION_TOOL_NAMES:
+            raise PermissionError(
+                f"Agent '{self.name}' may not use mutation tool "
+                f"'{tool_name}'; the Core Loop owns all execution."
+            )
+
         if not self.permissions.can_use_tool(tool_name):
             raise PermissionError(
                 f"Agent '{self.name}' does not have permission to use tool '{tool_name}'"
             )
         return self.tools[tool_name]
+
+    def can_access_tool(self, tool_name: str) -> bool:
+        """
+        Check if this agent's permission model allows a tool.
+
+        Step 2: mutation/command tools are never accessible to an agent.
+        """
+        if tool_name in MUTATION_TOOL_NAMES:
+            return False
+
+        return self.permissions.can_use_tool(tool_name)
 
     def has_capability(self, capability: str) -> bool:
         """
@@ -112,10 +157,6 @@ class Agent(ABC):
             True if the agent is permitted to use this capability.
         """
         return self.permissions.can_use_capability(capability)
-
-    def can_access_tool(self, tool_name: str) -> bool:
-        """Check if the agent's permission model allows a tool."""
-        return self.permissions.can_use_tool(tool_name)
 
     def get_persona_prefix(self) -> str:
         """
