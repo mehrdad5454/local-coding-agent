@@ -94,10 +94,11 @@ def mask_sensitive_content(content):
     return content
 
 
-def load_projects():
+def _load_projects_document():
+    # کل فایل projects.json، شامل کلید رزرو‌شده‌ی approval mode.
+    # فقط لایه‌ی داخلی از این استفاده می‌کند.
     if not os.path.isfile(PROJECTS_FILE):
-        save_projects(DEFAULT_PROJECTS.copy())
-        return DEFAULT_PROJECTS.copy()
+        return dict(DEFAULT_PROJECTS)
 
     try:
         with open(
@@ -116,14 +117,75 @@ def load_projects():
         return DEFAULT_PROJECTS.copy()
 
 
+def load_projects():
+    # فقط پروژه‌های واقعی برگردانده می‌شود (name -> path).
+    # کلید رزرو‌شده‌ی approval mode عمداً پنهان است تا هیچ
+    # مصرف‌کننده‌ی فعلی (UI، Routeها، re-validation) آن را
+    # به‌عنوان یک پروژه نبیند.
+    document = _load_projects_document()
+
+    if not os.path.isfile(PROJECTS_FILE):
+        # رفتار اولیه حفظ می‌شود: در اولین اجرا فایل ساخته می‌شود.
+        save_projects(document)
+
+    return {
+        name: value
+        for name, value in document.items()
+        if name != PROJECTS_APPROVAL_KEY
+    }
+
+
 def save_projects(projects):
+    # فقط پروژه‌های واقعی نوشته می‌شوند. کلید رزرو‌شده‌ی approval
+    # mode از ورودی دور ریخته می‌شود تا از مسیر عمومی (افزودن/حذف
+    # پروژه) کسی نتواند آن را بازنویسی کند.
+    payload = {
+        name: value
+        for name, value in (projects or {}).items()
+        if name != PROJECTS_APPROVAL_KEY
+    }
+
     with open(
         PROJECTS_FILE,
         "w",
         encoding="utf-8"
     ) as f:
         json.dump(
-            projects,
+            payload,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def save_projects_document(document):
+    """
+    Write the full projects.json document, including approval modes.
+
+    Used ONLY by set_project_approval_mode. Saving through this function
+    keeps the project paths already on disk and merges the given approval
+    modes into them.
+    """
+    document = dict(document or {})
+
+    payload = {
+        name: value
+        for name, value in document.items()
+        if name != PROJECTS_APPROVAL_KEY
+    }
+
+    modes = document.get(PROJECTS_APPROVAL_KEY)
+
+    if isinstance(modes, dict) and modes:
+        payload[PROJECTS_APPROVAL_KEY] = modes
+
+    with open(
+        PROJECTS_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            payload,
             f,
             ensure_ascii=False,
             indent=2
@@ -152,6 +214,79 @@ def remove_project(project_name):
     if project_name in projects:
         del projects[project_name]
         save_projects(projects)
+
+
+APPROVAL_MODE_MANUAL = "manual"
+APPROVAL_MODE_AUTONOMOUS = "autonomous"
+
+# Step 1 — Project Approval Mode.
+#
+# approval_mode is stored PER PROJECT inside projects.json, so changing one
+# project never affects another.
+#
+# Backward compatibility is the contract here: projects.json is a flat
+# {"name": "path"} mapping and every existing project has no mode at all.
+# A missing/invalid value therefore resolves to "manual", so no existing
+# project can ever silently become autonomous.
+#
+# NOTE: "autonomous" only removes the MANUAL APPROVAL prompt. It never
+# disables Emergency Stop, safe_path, re-validation, backup, journal or
+# command restrictions. Autonomous = Approval Off, NOT Safety Off.
+APPROVAL_MODES = (APPROVAL_MODE_MANUAL, APPROVAL_MODE_AUTONOMOUS)
+
+# Reserved key inside projects.json holding per-project approval modes.
+# A project literally named like this is not supported.
+PROJECTS_APPROVAL_KEY = "__approval_modes__"
+
+
+def normalize_approval_mode(value):
+    # Only an explicit, known mode is honoured. Everything else is manual
+    # (fail closed towards asking the user).
+    try:
+        mode = str(value or "").strip().lower()
+    except Exception:
+        return APPROVAL_MODE_MANUAL
+
+    if mode in APPROVAL_MODES:
+        return mode
+
+    return APPROVAL_MODE_MANUAL
+
+
+def get_project_approval_mode(project_name):
+    """Return the approval mode for one project (default: manual)."""
+    modes = _load_projects_document().get(PROJECTS_APPROVAL_KEY)
+
+    if not isinstance(modes, dict):
+        return APPROVAL_MODE_MANUAL
+
+    return normalize_approval_mode(modes.get(project_name))
+
+
+def set_project_approval_mode(project_name, mode):
+    """Persist the approval mode for exactly one project."""
+    document = _load_projects_document()
+
+    if project_name not in document:
+        return False
+
+    modes = document.get(PROJECTS_APPROVAL_KEY)
+
+    if not isinstance(modes, dict):
+        modes = {}
+
+    modes = dict(modes)
+    modes[project_name] = normalize_approval_mode(mode)
+
+    document[PROJECTS_APPROVAL_KEY] = modes
+
+    save_projects_document(document)
+
+    return True
+
+
+def is_autonomous_project(project_name):
+    return get_project_approval_mode(project_name) == APPROVAL_MODE_AUTONOMOUS
 
 
 def safe_path(
@@ -6384,6 +6519,7 @@ def build_pending_expiration_report(pending):
 # نگاشت نام ابزار Registry به action_type در Action Context.
 PENDING_TOOL_ACTION_TYPES = {
     "write_file": "write",
+    "write_files": "multi_write",
     "edit_file": "edit",
     "create_directory": "create_directory",
     "move_entry": "move",
@@ -6396,7 +6532,21 @@ def pending_action_paths(tool_name, args):
     # مسیرهای نسبی که Re-validation باید بررسی کند.
     # before = مسیری که before_state به آن اشاره دارد
     # target = مقصد (فقط برای move)
-    paths = {"before": None, "target": None}
+    # batch = همه‌ی مسیرهای یک Batch (برای write_files)
+    paths = {"before": None, "target": None, "batch": None}
+
+    if tool_name == "write_files":
+        # Step 1: هر عضو Batch جداگانه در Re-validation بررسی
+        # می‌شود، تا هیچ مسیری خارج از کنترل نماند.
+        # اگر ساختار Batch نامعتبر باشد، خطا به بالا منتقل می‌شود
+        # تا کل Batch به‌صورت Fail Closed رد شود.
+        files = normalize_batch_files(args)
+
+        paths["batch"] = [
+            entry.get("path") for entry in files
+        ]
+
+        return paths
 
     if tool_name == "move_entry":
         paths["before"] = tool_arg(
@@ -6455,6 +6605,29 @@ def build_pending_revalidation_context(
         target_rel = paths.get("target")
 
         context["target"] = target_rel or before_rel
+
+        # Step 1: وضعیت «قبل» تک‌تک اعضای Batch ثبت می‌شود تا
+        # هنگام Re-validation مشخص باشد کدام فایل‌ها تغییر کرده‌اند.
+        context["batch_paths"] = None
+        context["batch_states"] = None
+
+        batch_paths = paths.get("batch")
+
+        if batch_paths is not None:
+            context["batch_paths"] = list(batch_paths)
+            context["batch_states"] = {}
+
+            for batch_rel in batch_paths:
+                try:
+                    context["batch_states"][batch_rel] = (
+                        build_action_before_state(
+                            resolve_project_path(
+                                project_root, batch_rel
+                            )
+                        )
+                    )
+                except Exception:
+                    context["batch_states"][batch_rel] = None
 
         if before_rel:
             context["before_state_path"] = before_rel
@@ -6622,6 +6795,87 @@ def revalidate_pending_action(pending):
             )
 
         paths = pending_action_paths(tool_name, args)
+
+        # Step 1 — Batch Verification.
+        #
+        # A batch is verified member by member using the SAME rules as a
+        # single action. Fail closed: if ANY member is invalid, outside the
+        # project root, or changed since the plan was built, the WHOLE batch
+        # is rejected and nothing is executed. On success we return to the
+        # existing batch execution path with no change to its behaviour.
+        #
+        # This adds validation only. It never alters approval, never
+        # weakens Emergency Stop, and never touches the single-action path
+        # below, which runs unchanged.
+        if tool_name == "write_files":
+            # پیام خطای normalize_batch_files به Fail-Closed تبدیل
+            # می‌شود تا یک Batch ناقص هرگز مثل Single Action عبور نکند.
+            try:
+                batch_paths = pending_action_paths(
+                    tool_name, args
+                ).get("batch")
+            except Exception as e:
+                return fail(
+                    "ساختار Batch نامعتبر است؛ اجرا انجام نشد: "
+                    + str(e)
+                )
+
+            if not batch_paths:
+                return fail(
+                    "Batch فایل معتبری ندارد؛ اجرا انجام نشد."
+                )
+
+            recorded_batch_paths = context.get("batch_paths")
+
+            if (
+                not isinstance(recorded_batch_paths, list)
+                or list(recorded_batch_paths) != list(batch_paths)
+            ):
+                return fail(
+                    "اعضای Batch نسبت به Plan تغییر کرده‌اند."
+                )
+
+            recorded_states = context.get("batch_states")
+
+            if not isinstance(recorded_states, dict):
+                return fail(
+                    "اطلاعات وضعیت Batch در دسترس نیست."
+                )
+
+            for batch_rel in batch_paths:
+                try:
+                    batch_abs = resolve_project_path(
+                        recorded_root, batch_rel
+                    )
+
+                except Exception as e:
+                    return fail(
+                        "مسیر یکی از فایل‌های Batch دیگر معتبر نیست: "
+                        + str(batch_rel) + " :: " + str(e)
+                    )
+
+                if not is_inside_project(recorded_root, batch_abs):
+                    return fail(
+                        "مسیر یکی از فایل‌های Batch خارج از پروژه است: "
+                        + str(batch_rel)
+                    )
+
+                if batch_rel not in recorded_states:
+                    return fail(
+                        "وضعیت فایل Batch ثبت نشده است: "
+                        + str(batch_rel)
+                    )
+
+                mismatch = compare_pending_state(
+                    recorded_states.get(batch_rel),
+                    build_action_before_state(batch_abs),
+                    "فایل Batch",
+                )
+
+                if mismatch:
+                    return fail(mismatch)
+
+            return True, "", context
 
         before_rel = (
             context.get("before_state_path")
@@ -7870,6 +8124,150 @@ def tool_read_files(project_root, args):
     return tool_ok("\n\n".join(blocks), verified=True)
 
 
+def normalize_batch_files(args):
+    """
+    Normalize a batch write request into a list of file entries.
+
+    Accepts either:
+      {"files": [{"path": ..., "content": ...}, ...]}
+    or a JSON-encoded string of that shape (the model emits text, so the
+    whole object may arrive as a string).
+
+    Returns a list of dicts with "path" and "content" keys. It raises
+    ValueError on anything unusable so the caller fails closed.
+    """
+    payload = args
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            raise ValueError("آرگومان files باید JSON معتبر باشد.")
+
+    if not isinstance(payload, dict):
+        raise ValueError("آرگومان files باید یک شیء باشد.")
+
+    files = payload.get("files")
+
+    if files is None:
+        files = payload.get("batch")
+
+    if files is None:
+        files = payload.get("changes")
+
+    if isinstance(files, str):
+        try:
+            files = json.loads(files)
+        except Exception:
+            raise ValueError("لیست files باید JSON معتبر باشد.")
+
+    if not isinstance(files, list) or not files:
+        raise ValueError("آرگومان files باید یک لیست غیرخالی باشد.")
+
+    normalized = []
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("هر عضو files باید یک شیء باشد.")
+
+        path = item.get("path") or item.get("relative_path") or item.get("file")
+
+        if not path:
+            raise ValueError("هر عضو files باید دارای path باشد.")
+
+        content = item.get("content")
+
+        if content is None:
+            content = item.get("text")
+
+        if content is None:
+            content = item.get("body")
+
+        if content is None:
+            raise ValueError(
+                "هر عضو files باید دارای content باشد: " + str(path)
+            )
+
+        entry = {"path": str(path), "content": str(content)}
+
+        action = item.get("action")
+
+        if action:
+            entry["action"] = str(action)
+
+        normalized.append(entry)
+
+    return normalized
+
+
+def validate_batch_args(project_root, args):
+    """
+    Validate EVERY member of a batch before anything is executed.
+
+    This runs at plan time and again at execute time. Any invalid member
+    raises, which aborts the WHOLE batch: a partially valid batch is never
+    executed. All paths still go through resolve_project_path / safe_path,
+    so project boundary and traversal rules are unchanged.
+    """
+    files = normalize_batch_files(args)
+
+    if not files:
+        raise ValueError("Batch باید حداقل یک فایل داشته باشد.")
+
+    for entry in files:
+        resolve_project_path(project_root, entry["path"])
+
+    return files
+
+
+def tool_write_files(project_root, args):
+    """
+    Execute a whole batch of file writes as ONE atomic operation.
+
+    Delegates to the existing write_file_multi, which already performs
+    per-file transactional backup, atomic writes, post-write validation
+    and full rollback if any single file fails. No new write engine is
+    introduced here.
+    """
+    files = validate_batch_args(project_root, args)
+
+    try:
+        result = write_file_multi(
+            project_root,
+            files,
+            return_details=True,
+        )
+    except Exception as e:
+        return tool_fail(e)
+
+    if not result.get("success"):
+        return tool_fail(
+            result.get("error") or "Batch ناموفق بود."
+        )
+
+    written = [
+        item.get("relative_path")
+        for item in (result.get("files") or [])
+    ]
+
+    return {
+        "ok": True,
+        "verified": True,
+        "text": (
+            "Batch اجرا شد؛ "
+            + str(len(written))
+            + " فایل نوشته شد: "
+            + ", ".join(str(p) for p in written)
+        ),
+        "data": {
+            "batch": True,
+            "count": len(written),
+            "files": written,
+            "rolled_back": False,
+        },
+    }
+
+
 def tool_write_file(project_root, args):
     path = tool_arg(args, "path", "relative_path", "file")
     content = tool_arg(args, "content", "text", "body")
@@ -8149,6 +8547,15 @@ TOOL_REGISTRY = {
         "usage": '{"path": "docs/note.md", "content": "..."}',
         "description": "نوشتن/ساخت فایل (نیازمند تأیید)",
     },
+    # Step 1: batch write. One tool call = one logical operation and ONE
+    # approval for the whole batch. Execution is delegated to the existing
+    # atomic write_file_multi (transactional backup + rollback).
+    "write_files": {
+        "mutating": True,
+        "run": tool_write_files,
+        "usage": '{"files": [{"path": "a.php", "content": "..."}, {"path": "b.php", "content": "..."}]}',
+        "description": "نوشتن گروهی چند فایل به‌صورت یک Batch اتمیک (یک تأیید برای کل Batch؛ با شکست یک فایل، همه rollback می‌شوند)",
+    },
     "edit_file": {
         "mutating": True,
         "run": tool_edit_file,
@@ -8222,6 +8629,13 @@ def validate_mutating_args(project_root, tool_name, args):
 
         if cwd:
             resolve_project_path(project_root, cwd)
+
+        return
+
+    # Step 1: Batch. همه‌ی اعضا پیش از نمایش Plan اعتبارسنجی
+    # می‌شوند؛ یک عضو نامعتبر یعنی کل Batch رد می‌شود.
+    if tool_name == "write_files":
+        validate_batch_args(project_root, args)
 
         return
 
@@ -10005,7 +10419,20 @@ def run_loop_steps(
                         ]
                     )
 
-                remember_pending_action({
+                # Step 1 — Project Approval Mode affects THIS line only.
+                #
+                # The very same pending action (with its Re-validation
+                # context) is built in BOTH modes, so Emergency Stop,
+                # safe_path, project-boundary checks, re-validation,
+                # backup/undo and the journal behave identically.
+                #
+                # manual     -> store the pending action and wait for ONE
+                #               approval for the whole batch (unchanged).
+                # autonomous -> still run Re-validation, but do not ask;
+                #               execute immediately.
+                autonomous = is_autonomous_project(project_name)
+
+                pending_action = {
                     "tool": tool_name,
                     "args": args,
                     "project": project_name,
@@ -10022,7 +10449,135 @@ def run_loop_steps(
                         project_name,
                         allow_write=allow_write,
                     ),
-                })
+                }
+
+                if autonomous:
+                    # Re-validation runs BEFORE anything is executed and
+                    # stays fail-closed. Only the manual prompt is skipped.
+                    if is_stop_requested(stop_event):
+                        return build_loop_report(
+                            project_name,
+                            project_root,
+                            transcript,
+                            notes=[
+                                EMERGENCY_STOP_MESSAGE,
+                                "Batch اجرا نشد؛ هیچ تغییری انجام نشد.",
+                            ]
+                        )
+
+                    ok, reason, _ = revalidate_pending_action(
+                        pending_action
+                    )
+
+                    if not ok:
+                        observations.append(
+                            "Batch به دلیل Re-validation رد شد: "
+                            + str(reason)
+                        )
+
+                        return build_loop_report(
+                            project_name,
+                            project_root,
+                            transcript,
+                            notes=[
+                                "Re-validation ناموفق بود؛ "
+                                "هیچ فایلی نوشته نشد."
+                            ]
+                        )
+
+                    emit_progress(
+                        progress,
+                        "autonomous_execute",
+                        step=steps_used,
+                        tool=tool_name
+                    )
+
+                    # اجرای مستقیم از همان Registry و همان مسیر
+                    # موجودِ execute_pending_action استفاده می‌شود؛
+                    # بنابراین Backup، Atomic write، Verify و
+                    # Journal هیچ‌کدام دور زده نمی‌شوند.
+                    try:
+                        autonomous_result = spec["run"](
+                            project_root, args
+                        )
+
+                    except Exception as e:
+                        autonomous_result = tool_fail(e)
+
+                    record_action(
+                        "multi_write" if tool_name == "write_files"
+                        else str(PENDING_TOOL_ACTION_TYPES.get(
+                            tool_name, tool_name
+                        )),
+                        operation_class=ACTION_CLASS_USER,
+                        tool=tool_name,
+                        args={"paths": [
+                            item.get("path") for item in
+                            normalize_batch_files(args)
+                        ]} if tool_name == "write_files" else args,
+                        project=project_name,
+                        project_root=project_root,
+                        approval_state=ACTION_APPROVAL_APPROVED,
+                        execution_state=ACTION_STATE_DONE,
+                        result_summary=summarize_action_result(
+                            "autonomous batch executed"
+                            if tool_name == "write_files"
+                            else "autonomous action executed"
+                        ),
+                    )
+
+                    entry = {
+                        "step": steps_used,
+                        "tool": tool_name,
+                        "args": args,
+                        "result": autonomous_result,
+                        "mutating": True,
+                        "verified": (
+                            autonomous_result.get("verified")
+                            if isinstance(autonomous_result, dict)
+                            else None
+                        ),
+                        "autonomous": True,
+                    }
+
+                    transcript.append(entry)
+                    observations.append(
+                        format_observation(
+                            steps_used,
+                            tool_name,
+                            args,
+                            autonomous_result,
+                            True
+                        )
+                    )
+
+                    emit_progress(
+                        progress,
+                        "tool_done",
+                        step=steps_used,
+                        tool=tool_name,
+                        mutating=True,
+                        ok=not result_was_unsuccessful(
+                            autonomous_result
+                        ),
+                        verified=entry["verified"],
+                    )
+
+                    return run_loop_steps(
+                        user_request=user_request,
+                        project_root=project_root,
+                        project_name=project_name,
+                        allow_write=True,
+                        transcript=transcript,
+                        observations=observations,
+                        steps_used=steps_used,
+                        correction_attempts=correction_attempts,
+                        max_steps=max_steps,
+                        stop_event=stop_event,
+                        progress=progress,
+                    )
+
+                remember_pending_action(pending_action)
 
                 emit_progress(
                     progress,
