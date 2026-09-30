@@ -9207,10 +9207,92 @@ def build_tool_reference():
     return "\n".join(lines)
 
 
-def validate_mutating_args(project_root, tool_name, args):
+def request_mentions_path(user_request, relative_path):
+    # آیا کاربر همین مسیر را در متن درخواست نام برده است؟
+    # هر دو شکل «پوشه/فایل» و «فایل» جداگانه سنجیده می‌شوند تا
+    # ذخیره‌سازی هر دو شکل در متن، مسیر را قطعی کند.
+    normalized = str(relative_path or "").replace("\\", "/").strip("/")
+
+    if not normalized:
+        return False
+
+    haystack = normalize_request_text(user_request or "").replace(
+        "\\", "/"
+    )
+    basename = normalized.rsplit("/", 1)[-1]
+
+    return (
+        normalized.lower() in haystack
+        or (len(basename) > 2 and basename.lower() in haystack)
+    )
+
+
+def request_asks_for_new_file(user_request):
+    # درخواست صریحاً «ساختن چیز جدید» است؛ در این حالت یک مسیر
+    # ناموجود حدس نیست و رفتار قبلی حفظ می‌شود.
+    return contains_any(
+        normalize_request_text(user_request or ""), CREATE_KEYWORDS
+    )
+
+
+def ensure_mutation_target_is_grounded(project_root, path, user_request):
+    # ضد حدس (Anti-guess).
+    #
+    # ریشه‌ی خطای «Plan با index.php به‌جای index.html»: مدل وقتی
+    # نام فایل را در درخواست نمی‌بیند، از مثال‌های داخل
+    # Tool Reference (که خودشان index.php / style.css دارند)
+    # نام کپی می‌کند. validate_mutating_args فقط امنیت مسیر را
+    # می‌سنجید، نه وجود مسیر؛ بنابراین یک مسیر کاملاً ساختگی
+    # به Plan راه می‌یافت.
+    #
+    # قانون کم‌ریسک: مسیرِ ناموجود فقط وقتی Plan می‌شود که یکی
+    # از این سه برقرار باشد:
+    #   1) درخواست اصلاً نیتِ تغییر نمی‌گوید (حالا رفتار قبلی
+    #      حفظ می‌شود)، یا
+    #   2) درخواست صریحاً «ساختن فایل جدید» می‌گوید، یا
+    #   3) کاربر همان نام را در متن درخواست آورده است.
+    # در غیر این صورت Plan ساخته نمی‌شود و به مدل گفته می‌شود
+    # نام واقعی را از فایل‌های پروژه بردارد.
+    #
+    # این بررسی فقط برای ابزارهای تغییردهنده اجرا می‌شود؛ ابزارهای
+    # فقط‌خواندنی (که کاوش مسیر ناموجود کاملاً مجاز است) اصلاً
+    # به این تابع نمی‌رسند.
+    if not user_request:
+        return
+
+    if not request_asks_for_mutation(user_request):
+        return
+
+    if request_asks_for_new_file(user_request):
+        return
+
+    full_path = resolve_project_path(project_root, path)
+
+    if os.path.exists(full_path):
+        return
+
+    if request_mentions_path(user_request, path):
+        return
+
+    raise ValueError(
+        "مسیر «" + str(path) + "» نه در پروژه وجود دارد و نه در "
+        "درخواست نام برده شده است؛ این یک حدس است و Plan ساخته "
+        "نشد. نام واقعی فایل را از فهرست فایل‌های پروژه بردار و "
+        "دوباره تلاش کن."
+    )
+
+
+def validate_mutating_args(project_root, tool_name, args,
+                          user_request=None):
     # قبل از نمایش Plan، آرگومانها و مسیرها بررسی میشوند.
     # مسیرها با safe_path/resolve_project_path کنترل
     # میشوند تا چیزی خارج از پروژه پیشنهاد نشود.
+    #
+    # user_request اختیاری است: وقتی فرستاده شود، مسیرهای
+    # تغییردهنده علاوه بر کنترل مرز پروژه، از نظر «واقعی بودن»
+    # هم سنجیده می‌شوند (ensure_mutation_target_is_grounded).
+    # نبودن آن فقط به معنای فعال‌نبودن همین بررسی جدید است؛
+    # هیچ کنترل امنیتی دیگری تغییر نمی‌کند.
     if tool_name == "run_command":
         command = tool_arg(args, "command", "cmd", "shell")
 
@@ -9227,7 +9309,12 @@ def validate_mutating_args(project_root, tool_name, args):
     # Step 1: Batch. همه‌ی اعضا پیش از نمایش Plan اعتبارسنجی
     # می‌شوند؛ یک عضو نامعتبر یعنی کل Batch رد می‌شود.
     if tool_name == "write_files":
-        validate_batch_args(project_root, args)
+        files = validate_batch_args(project_root, args)
+
+        for entry in files:
+            ensure_mutation_target_is_grounded(
+                project_root, entry["path"], user_request
+            )
 
         return
 
@@ -9251,6 +9338,11 @@ def validate_mutating_args(project_root, tool_name, args):
         raise ValueError("آرگومان path لازم است.")
 
     resolve_project_path(project_root, path)
+
+    if tool_name in ("write_file", "edit_file"):
+        ensure_mutation_target_is_grounded(
+            project_root, path, user_request
+        )
 
     if tool_name == "write_file":
         if tool_arg(args, "content", "text", "body") is None:
@@ -9867,6 +9959,16 @@ def build_loop_user_prompt(
     parts.append("CURRENT REQUEST:")
     parts.append(str(user_request))
     parts.append("")
+
+    # ضد حدس: برای درخواست‌های تغییردهنده، نام فایل‌های واقعی
+    # پروژه به مدل داده می‌شود تا Plan روی مسیر واقعی ساخته شود.
+    # درخواست‌های فقط‌خواندنی عمداً دست‌نخورده می‌مانند.
+    if project_root and request_asks_for_mutation(user_request):
+        inventory = build_project_file_inventory(project_root)
+
+        if inventory:
+            parts.append(inventory)
+            parts.append("")
 
     # Phase H: برگه واقعیت‌ها در گام‌های اولیه تزریق می‌شود
     # تا مدل به‌جای حدس زدن نام قالب/افزونه/مسیر، از نام‌های
@@ -10941,6 +11043,93 @@ def is_wordpress_project_root(project_root):
     return "wp-config.php" in names
 
 
+PROJECT_INVENTORY_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", "node_modules",
+    ".idea", ".vscode", ".next", ".nuxt", "dist", "build",
+    "vendor", ".venv", "venv", ".cache", ".pytest_cache",
+}
+
+PROJECT_INVENTORY_SKIP_SUFFIXES = (
+    ".agent-backup",
+)
+
+MAX_PROJECT_INVENTORY_FILES = 60
+
+
+def build_project_file_inventory(project_root, max_files=None):
+    # فهرست قطعی فایل‌های واقعی پروژه (فقط‌خواندنی).
+    #
+    # ریشه‌ی خطای «index.php به‌جای index.html»: مدل در
+    # Tool Reference چند مثال ثابت می‌بیند (index.php در
+    # find_entries/read_file و style.css در edit_file) و وقتی
+    # نام فایل در درخواست نیامده، همان مثال‌ها را کپی می‌کند.
+    # با دادن نام‌های واقعی پروژه، حدس از بین می‌رود.
+    #
+    # این فهرست فقط‌خواندنی است، سقف‌دار است و هیچ فایلی را
+    # تغییر نمی‌دهد.
+    if not project_root or not os.path.isdir(project_root):
+        return ""
+
+    if max_files is None:
+        max_files = MAX_PROJECT_INVENTORY_FILES
+
+    try:
+        max_files = max(1, int(max_files))
+
+    except Exception:
+        max_files = MAX_PROJECT_INVENTORY_FILES
+
+    found = []
+
+    for current, dirs, files in os.walk(project_root):
+        dirs[:] = sorted(
+            d for d in dirs if d not in PROJECT_INVENTORY_SKIP_DIRS
+        )
+
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+
+            if name.endswith(PROJECT_INVENTORY_SKIP_SUFFIXES):
+                continue
+
+            full = os.path.join(current, name)
+            relative = os.path.relpath(full, project_root)
+
+            if relative.startswith(".."):
+                continue
+
+            found.append(relative.replace("\\", "/"))
+
+            if len(found) >= max_files:
+                break
+
+        if len(found) >= max_files:
+            break
+
+    if not found:
+        return ""
+
+    lines = [
+        "REAL FILES IN THIS PROJECT (read from disk - these are the "
+        "only paths that exist; anything else is a guess):",
+    ]
+    lines.extend("- " + item for item in found)
+
+    if len(found) >= max_files:
+        lines.append(
+            "- (list truncated at " + str(max_files)
+            + " entries; use structure/list_directory for more)"
+        )
+
+    lines.append(
+        "- Use these exact relative paths in ARGS. Never invent a "
+        "filename, and never copy a filename from a tool example."
+    )
+
+    return "\n".join(lines)
+
+
 def build_loop_project_facts(project_root):
     # Phase H: برگه واقعیت‌های پروژه، به‌صورت قطعی و فقط‌خواندنی.
     #
@@ -11392,7 +11581,8 @@ def run_loop_steps(
         if spec["mutating"]:
             try:
                 validate_mutating_args(
-                    project_root, tool_name, args
+                    project_root, tool_name, args,
+                    user_request=user_request
                 )
 
             except Exception as e:
