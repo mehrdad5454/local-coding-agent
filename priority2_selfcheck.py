@@ -127,15 +127,26 @@ def test_edit_suggests_in_feedback(temp_root):
 
 
 def test_invalid_tool_does_not_consume_step(temp_root):
-    # 4) تلاش نامعتبر نباید Step مصرف کند: با max_steps=1
-    #    باید هنوز فرصت اصلاح داشته باشد.
+    # 4) تلاش نامعتبر نباید Step مصرف کند: یک گام کامل برای
+    #    read_file و یکی هم برای ویرایش باقی می‌ماند، چون نام
+    #    نامعتبر هیچ گامی مصرف نمی‌کند.
+    #
+    # edit_file فقط روی فایلِ خوانده‌شده Plan می‌سازد. پسوند
+    # عمداً .md است تا assert «bounded stop wrote nothing» که
+    # نبودِ فایل .txt را می‌سنجد، تحت تأثیر قرار نگیرد.
+    target = os.path.join(temp_root, "s1.md")
+
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("a")
+
     out, obs, calls = run_loop_with(
-        ["THOUGHT: t\nTOOL: edit\nARGS: {\"path\":\"x.txt\"}",
+        ["THOUGHT: t\nTOOL: read_file\nARGS: {\"path\":\"s1.md\"}",
+         "THOUGHT: t\nTOOL: edit\nARGS: {\"path\":\"x.txt\"}",
          "THOUGHT: t\nTOOL: edit_file\nARGS: "
-         "{\"path\":\"s1.txt\",\"old\":\"a\",\"new\":\"b\"}",
+         "{\"path\":\"s1.md\",\"old\":\"a\",\"new\":\"b\"}",
          "FINAL: done"],
         temp_root,
-        max_steps=1,
+        max_steps=2,
     )
 
     pending = agent.get_pending_action()
@@ -185,8 +196,15 @@ def test_invalid_tool_causes_no_mutation(temp_root):
 
 def test_valid_tool_no_regression(temp_root):
     # 7) ابزار معتبر مثل edit_file بدون regression کار کند.
+    #    edit_file فقط روی فایلِ قبلاً خوانده‌شده Plan می‌سازد.
+    target = os.path.join(temp_root, "ok.txt")
+
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("a")
+
     out, obs, _ = run_loop_with(
-        [("edit_file", "{\"path\":\"ok.txt\",\"old\":\"a\",\"new\":\"b\"}")],
+        [("read_file", '{"path":"ok.txt"}'),
+         ("edit_file", '{"path":"ok.txt","old":"a","new":"b"}')],
         temp_root,
     )
 

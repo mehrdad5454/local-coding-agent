@@ -11024,6 +11024,69 @@ def read_paths_already_seen(transcript):
     return seen
 
 
+def ensure_edit_file_proposal_is_grounded(
+    project_root, args, transcript
+):
+    # پیش‌شرط ساخت Plan برای edit_file (خواندن + محتوای واقعی).
+    #
+    # ریشه‌ی خطای «Plan با محتوای فرضی»: edit_file به یک رشتهٔ
+    # `old` دقیق نیاز دارد، ولی هیچ‌جا اجباری نبود که مدل قبل از
+    # پیشنهاد آن، فایل را بخواند. نتیجه: مدل در گام اول بدون
+    # هیچ ابزاری یک Plan می‌ساخت و `old` را از خودش اختراع
+    # می‌کرد؛ آن Plan به کاربر نشان داده می‌شد و فقط بعد از تأیید
+    # (یعنی دیرهنگام) شکست می‌خورد.
+    #
+    # این تابع دقیقاً همان دو شکست را می‌بندد:
+    #   A) فایل هدف باید قبلاً در همین حلقه با read_file /
+    #      read_files خوانده شده باشد.
+    #   C) رشتهٔ `old` باید واقعاً داخل محتوای فعلی همان فایل باشد.
+    #
+    # این بررسی فقط برای edit_file و فقط در حالت Write است.
+    # در حالت فقط‌خواندنی هیچ تغییری رخ نمی‌دهد، پس مسیر موجود
+    # و آزموده‌شدهٔ «فقط بررسی» دست‌نخورده می‌ماند.
+    # write_file / write_files محتوای کامل می‌گیرند و به خواندن
+    # قبلی نیازی ندارند، و ابزارهای فقط‌خواندنی اصلاً به این مسیر
+    # نمی‌رسند.
+    path = tool_arg(args, "path", "relative_path", "file", "dir")
+
+    if not path:
+        return
+
+    normalized = normalize_relative_target(path)
+
+    if not normalized:
+        return
+
+    if normalized not in read_paths_already_seen(transcript):
+        raise ValueError(
+            "قبل از پیشنهاد ویرایش روی «" + str(path) + "»، باید "
+            "همین فایل را با read_file بخوانی. بدون محتوای واقعی "
+            "فایل، رشتهٔ old قابل ساختن نیست و Plan ساخته نشد."
+        )
+
+    old_text = tool_arg(args, "old", "old_text", "find", "search")
+
+    if not isinstance(old_text, str) or not old_text:
+        return
+
+    try:
+        content = read_file(project_root, path)
+
+    except Exception as e:
+        raise ValueError(
+            "محتوای «" + str(path) + "» برای بررسی old خوانده نشد "
+            "(" + str(e) + ")؛ Plan ساخته نشد."
+        )
+
+    if old_text not in content:
+        raise ValueError(
+            "رشتهٔ old در محتوای واقعی فایل «" + str(path) + "» "
+            "وجود ندارد؛ این متن حدسی است و Plan ساخته نشد. "
+            "فایل را با read_file بخوان و old را عیناً از محتوای "
+            "واقعی کپی کن."
+        )
+
+
 def is_wordpress_project_root(project_root):
     # تشخیص وردپرس فقط از روی ساختار دیسک، مستقل از تحلیل‌گر.
     if not project_root or not os.path.isdir(project_root):
@@ -11621,6 +11684,24 @@ def run_loop_steps(
                 )
 
             if not auto_correction:
+                # پیش‌شرط edit_file: فایل باید در همین حلقه
+                # خوانده شده باشد و `old` باید در محتوای واقعی
+                # آن باشد. بدون این دو، Plan ساخته نمی‌شود تا
+                # کاربر متن حدسی مدل را تأیید نکند.
+                if tool_name == "edit_file" and is_write_allowed(allow_write):
+                    try:
+                        ensure_edit_file_proposal_is_grounded(
+                            project_root, args, transcript
+                        )
+
+                    except Exception as e:
+                        observations.append(
+                            "این گام رد شد (ویرایش بدون مبنای "
+                            "واقعی): " + str(e)
+                        )
+
+                        continue
+
                 plan_text = build_pending_plan_text(
                     tool_name, args, project_root,
                     write_mode=allow_write

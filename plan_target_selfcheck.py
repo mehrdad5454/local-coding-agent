@@ -165,6 +165,8 @@ def pending_targets():
 
 def test_real_targets_are_accepted(temp_root):
     # 1) هر دو فایل واقعی پروژه باید Plan بسازند.
+    #    edit_file فقط وقتی Plan می‌سازد که فایل هدف قبلاً در همین
+    #    حلقه خوانده شده باشد و `old` در محتوای واقعی آن باشد.
     for target, old, new in (
         ("index.html", "<title>Agent Test</title>",
          "<title>Local Agent Demo</title>"),
@@ -174,7 +176,10 @@ def test_real_targets_are_accepted(temp_root):
         args = {"path": target, "old": old, "new": new}
 
         try:
-            agent.validate_mutating_args(temp_root, "edit_file", args)
+            agent.ensure_edit_file_proposal_is_grounded(
+                temp_root, args,
+                [{"tool": "read_file", "args": {"path": target}}],
+            )
             accepted = True
             reason = ""
 
@@ -184,9 +189,10 @@ def test_real_targets_are_accepted(temp_root):
 
         check("PLAN: real target accepted -> " + target, accepted, reason)
 
-        run_loop([("edit_file", {
-            "path": target, "old": old, "new": new})],
-            temp_root, max_steps=2)
+        run_loop([
+            ("read_file", {"path": target}),
+            ("edit_file", {"path": target, "old": old, "new": new}),
+        ], temp_root, max_steps=3)
 
         targets = pending_targets()
         check(
@@ -195,6 +201,65 @@ def test_real_targets_are_accepted(temp_root):
             safe(targets),
         )
         agent.clear_pending_action()
+
+
+def test_edit_without_prior_read_is_blocked(temp_root):
+    # A) edit_file بدون read_file قبلی نباید Plan بسازد.
+    fabricated = "<h1>Original Title</h1><p>This is a paragraph.</p>"
+
+    check(
+        "SETUP: fabricated old is absent from the real file",
+        fabricated not in INDEX_HTML,
+    )
+
+    agent.clear_pending_action()
+
+    _, observations, _ = run_loop([("edit_file", {
+        "path": "index.html",
+        "old": fabricated,
+        "new": "<h1>Local Agent Demo</h1>",
+    })], temp_root, max_steps=4)
+
+    check(
+        "EDIT: no plan without a prior read_file",
+        not pending_targets(),
+        safe(pending_targets()),
+    )
+    check(
+        "EDIT: blocked step explains the read_file requirement",
+        any("read_file" in str(o) for o in observations),
+        safe(observations),
+    )
+    agent.clear_pending_action()
+
+
+def test_edit_with_fabricated_old_is_blocked(temp_root):
+    # C) حتی بعد از read_file، اگر `old` در محتوای واقعی نباشد
+    #    نباید Plan ساخته شود.
+    fabricated = "<h1>Original Title</h1><p>This is a paragraph.</p>"
+
+    agent.clear_pending_action()
+
+    _, observations, _ = run_loop([
+        ("read_file", {"path": "index.html"}),
+        ("edit_file", {
+            "path": "index.html",
+            "old": fabricated,
+            "new": "<h1>Local Agent Demo</h1>",
+        }),
+    ], temp_root, max_steps=4)
+
+    check(
+        "EDIT: fabricated old is rejected after a real read",
+        not pending_targets(),
+        safe(pending_targets()),
+    )
+    check(
+        "EDIT: rejection names the missing old text",
+        any("حدسی" in str(o) for o in observations),
+        safe(observations),
+    )
+    agent.clear_pending_action()
 
 
 def test_guessed_path_never_becomes_a_plan(temp_root):
@@ -429,6 +494,8 @@ def main():
 
     try:
         test_real_targets_are_accepted(temp_root)
+        test_edit_without_prior_read_is_blocked(temp_root)
+        test_edit_with_fabricated_old_is_blocked(temp_root)
         test_guessed_path_never_becomes_a_plan(temp_root)
         test_guessed_batch_is_rejected(temp_root)
         test_explicit_new_file_is_still_allowed(temp_root)

@@ -54,13 +54,22 @@ def make_pending(temp_root, tool="edit_file", args=None, project="probe"):
 
 
 def run_loop(temp_root, allow_write, tool_name, args_json,
-             project="probe", max_steps=3):
+             project="probe", max_steps=3, setup_json=None):
     # اجرای واقعی run_loop_steps با مدل شبیه‌سازی‌شده.
+    #
+    # setup_json اختیاری است: اگر داده شود، اول یک ابزار
+    # فقط‌خواندنی اجرا می‌شود تا transcript واقعی بسازد. این برای
+    # edit_file لازم است، چون یک ویرایش فقط وقتی Plan می‌سازد که
+    # فایل هدف قبلاً خوانده شده و `old` در محتوای واقعی آن باشد.
     calls = {"n": 0}
 
     def stub(system_prompt, user_prompt, *a, **kw):
         calls["n"] += 1
-        if calls["n"] == 1:
+        if setup_json and calls["n"] == 1:
+            return "THOUGHT: read first\nTOOL: read_file\nARGS: %s" % (
+                setup_json
+            )
+        if calls["n"] == (2 if setup_json else 1):
             return "THOUGHT: probe\nTOOL: %s\nARGS: %s" % (
                 tool_name, args_json
             )
@@ -88,11 +97,20 @@ def run_loop(temp_root, allow_write, tool_name, args_json,
 
 def test_plan_creates_pending(temp_root):
     # 1) Plan قابل اجرا باید Pending Action واقعی بسازد.
+    #
+    # edit_file فقط روی فایلی Plan می‌سازد که قبلاً در همین حلقه
+    # خوانده شده و `old` واقعاً داخل محتوای آن است؛ پس فایل روی
+    # دیسک ساخته و ابتدا با read_file خوانده می‌شود.
     agent.clear_pending_action()
+    target = os.path.join(temp_root, "p1.txt")
+
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("a")
 
     out, _ = run_loop(
         temp_root, True, "edit_file",
         '{"path":"p1.txt","old":"a","new":"b"}',
+        setup_json='{"path":"p1.txt"}',
     )
     pending = agent.get_pending_action()
 
