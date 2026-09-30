@@ -19,7 +19,9 @@ from agent import (
     add_project,
     remove_project,
     write_file_multi,
-    get_last_write_multi_result
+    get_last_write_multi_result,
+    get_pending_action,
+    handle_pending_action_request,
 )
 import os
 import time
@@ -372,6 +374,104 @@ def handle_cors_preflight():
     if request.method == "OPTIONS":
         resp = app.make_response(("", 204))
         return resp
+
+
+# ---------------------------------------------------------
+# Approval actions (فقط لایه web)
+# ---------------------------------------------------------
+# دکمه‌های «تأیید» / «لغو» دقیقاً همان مسیر امن موجود
+# را اجرا می‌کنند: handle_pending_action_request با همان
+# کلیدواژه‌ای که کاربر دستی می‌فرستد («تأیید» / «لغو»).
+#
+# هیچ مسیر Write جدیدی ساخته نمی‌شود و هیچ Approval،
+# Emergency Stop، Re-validation یا Manual/Autonomous
+# منطقی تغییر نمی‌کند؛ فقط درخواست به‌جای ورود به
+# Agentic Loop، مستقیم به Gate تأیید route می‌شود.
+APPROVAL_ACTION_TEXTS = {
+    "approve": "تأیید",
+    "cancel": "لغو",
+}
+
+
+def resolve_approval_action(value):
+    # فقط action های صریح پذیرفته می‌شوند.
+    # ورودی ناشناخته یعنی «درخواست عادی Agent».
+    if not isinstance(value, str):
+        return None
+
+    return APPROVAL_ACTION_TEXTS.get(value.strip().lower())
+
+
+def run_approval_background(
+    control_text,
+    project_name,
+    allow_write=False,
+    stop_event=None,
+):
+    # اجرای همان Gate تأیید موجود در agent.py.
+    # خروجی None یعنی «Pending Action وجود ندارد»؛ در آن
+    # حالت هیچ درخواستی وارد Loop نمی‌شود و فقط پیام
+    # امن نمایش داده می‌شود.
+    global last_result, current_stop_event
+    started_at = time.time()
+    runtime_info["started_at"] = started_at
+
+    try:
+        set_agent_status(
+            AGENT_STATUS_RUNNING,
+            "در حال اجرای تأیید Plan...",
+        )
+
+        last_result = handle_pending_action_request(
+            control_text,
+            allow_write=allow_write,
+            stop_event=stop_event,
+        )
+
+        if last_result is None:
+            last_result = (
+                "Plan در انتظار تأیید وجود ندارد؛ "
+                "هیچ تغییری انجام نشد."
+            )
+
+        if stop_event is not None and stop_event.is_set():
+            set_agent_status(
+                AGENT_STATUS_STOPPED,
+                "درخواست توسط کاربر متوقف شد.",
+            )
+        else:
+            set_agent_status(AGENT_STATUS_DONE, "اجرا کامل شد.")
+
+    except Exception as e:
+
+        last_result = "خطای Agent:\n\n" + str(e)
+        set_agent_status(
+            AGENT_STATUS_ERROR,
+            "خطا: " + str(e),
+        )
+
+    finally:
+        finished_at = time.time()
+        duration = max(0.0, finished_at - started_at)
+        runtime_info["finished_at"] = finished_at
+        runtime_info["duration"] = duration
+        remember_chat_turn(
+            project_name,
+            control_text,
+            last_result,
+            agent_status,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration=duration,
+        )
+        if current_stop_event is stop_event:
+            current_stop_event = None
+
+
+def has_pending_approval():
+    # فقط خواندن وضعیت Pending Action برای نمایش دکمه‌ها.
+    # هیچ تغییری در agent.py و هیچ Write ایجاد نمی‌شود.
+    return get_pending_action() is not None
 
 
 @app.after_request
@@ -1151,6 +1251,52 @@ button:hover {
     color: #155eef;
 }
 
+.approval-box {
+    margin-top: 18px;
+    border: 1px solid #e2e5ea;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.approval-row {
+    display: flex;
+    gap: 10px;
+    padding: 13px 15px;
+    background: #f7f8fa;
+    border-top: 1px solid #e2e5ea;
+}
+
+.approval-row button {
+    margin: 0;
+    width: auto;
+    padding: 0 22px;
+}
+
+.approve-button {
+    background: #0f7b3f;
+    color: #fff;
+    border: 1px solid #0b6231;
+}
+
+.approve-button:hover {
+    background: #0d6a36;
+}
+
+.cancel-button {
+    background: #fff;
+    color: #c62828;
+    border: 1px solid #e2bcbc;
+}
+
+.cancel-button:hover {
+    background: #fff4f4;
+}
+
+.approval-row button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
 .validation-bad {
     padding: 13px 15px;
     background: #fdf0f0;
@@ -1355,6 +1501,52 @@ button:hover {
 </div>
 {% endif %}
 
+{% if approval_pending %}
+<div class="approval-box" id="approvalBox">
+    <div class="diff-title">تصمیم درباره Plan</div>
+
+    <form
+        method="post"
+        action="/"
+        class="approval-row"
+        id="approvalForm">
+
+        <input
+            type="hidden"
+            name="project"
+            value="{{ project_name | e }}"
+        >
+
+        <input
+            type="hidden"
+            name="mode"
+            value="{{ mode }}"
+        >
+
+        <button
+            type="submit"
+            name="approval_action"
+            value="approve"
+            class="approve-button"
+        >تأیید</button>
+
+        <button
+            type="submit"
+            name="approval_action"
+            value="cancel"
+            class="cancel-button"
+        >لغو</button>
+
+    </form>
+
+    <div class="diff-note">
+        «تأیید» و «لغو» دقیقاً معادل فرمان متنی
+        «تأیید» / «لغو» هستند و از همان مسیر امن Approval
+        عبور می‌کنند.
+    </div>
+</div>
+{% endif %}
+
 {% if diff_state == "changed" %}
 <div class="diff-box">
     <div class="diff-title">{{ diff_title }}</div>
@@ -1462,6 +1654,38 @@ document.getElementById("request").addEventListener("keydown", function(e) {
     form.requestSubmit();
 });
 
+// دکمه‌های تأیید / لغو: بعد از کلیک غیرفعال می‌شوند تا
+// یک Plan دوبار اجرا یا دوبار لغو نشود.
+// هیچ درخواست جدیدی ساخته نمی‌شود؛ همان form موجود به
+// همان endpoint "/" با action مشخص ارسال می‌شود.
+var approvalForm = document.getElementById("approvalForm");
+
+if (approvalForm) {
+    approvalForm.addEventListener("submit", function() {
+        var buttons = approvalForm.querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i++) {
+            buttons[i].disabled = true;
+        }
+        if (stopButton) stopButton.disabled = false;
+    });
+}
+
+// نمایش/پنهان‌سازی کادر Approval فقط از داده‌های موجود
+// در /status خوانده می‌شود (pending_approval). این تابع
+// هیچ Write یا اجرایی انجام نمی‌دهد.
+function renderApprovalBox(data) {
+    var box = document.getElementById("approvalBox");
+    if (!box) return;
+    var pending = !!data.pending_approval;
+    box.style.display = pending ? "" : "none";
+    if (!pending && approvalForm) {
+        var buttons = approvalForm.querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i++) {
+            buttons[i].disabled = false;
+        }
+    }
+}
+
 function stopAgent() {
     fetch("/stop", {
         method: "POST",
@@ -1495,6 +1719,7 @@ function pollStatus() {
             renderAgentHeader(data);
             renderProgress(data.progress || []);
             renderLastResult(data);
+            renderApprovalBox(data);
             pollChatHistory();
             var box = document.querySelector(".status");
             if (!box) return;
@@ -1905,6 +2130,10 @@ def index():
     # هیچ Write چندفایلی در این مرحله فعال نمی‌شود.
     file_plan = None
 
+    # Plan در انتظار تأیید: فقط برای نمایش دکمه‌های
+    # تأیید/لغو خوانده می‌شود و هیچ تغییری ایجاد نمی‌کند.
+    approval_pending = has_pending_approval()
+
     # نتیجه Validation فقط بعد از Write موفق پر می‌شود؛
     # در حالت Read خالی می‌ماند و چیزی نمایش داده نمی‌شود.
     validation_text = ""
@@ -1958,7 +2187,56 @@ def index():
             "read"
         )
 
-        if request_text:
+        # دکمه‌های تأیید/لغو action را به‌صورت صریح
+        # می‌فرستند. این شاخه قبل از هر پردازش دیگری
+        # بررسی می‌شود تا «تأیید» هرگز به‌عنوان درخواست
+        # جدید Agent وارد Agentic Loop نشود.
+        approval_text = resolve_approval_action(
+            request.form.get("approval_action")
+        )
+
+        if approval_text is not None:
+
+            if is_agent_running():
+
+                result = "Agent در حال اجراست"
+
+            else:
+
+                del agent_progress[:]
+                last_result = ""
+
+                allow_write = (
+                    mode == "write"
+                )
+
+                global current_stop_event
+                stop_event = threading.Event()
+                current_stop_event = stop_event
+
+                set_agent_status(
+                    AGENT_STATUS_RUNNING,
+                    "در حال اجرای تأیید Plan...",
+                )
+
+                global agent_thread
+
+                agent_thread = threading.Thread(
+                    target=run_approval_background,
+                    args=(approval_text,),
+                    kwargs={
+                        "project_name": project_name,
+                        "allow_write": allow_write,
+                        "stop_event": stop_event,
+                    },
+                    daemon=True,
+                )
+
+                agent_thread.start()
+
+                running = True
+
+        elif request_text:
 
             # اجرای همزمان مجاز نیست؛ صفحه قفل نمی‌شود.
             if is_agent_running():
@@ -1975,7 +2253,6 @@ def index():
                     mode == "write"
                 )
 
-                global current_stop_event
                 stop_event = threading.Event()
                 current_stop_event = stop_event
 
@@ -1983,8 +2260,6 @@ def index():
                     AGENT_STATUS_RUNNING,
                     "در حال اجرای درخواست...",
                 )
-
-                global agent_thread
 
                 agent_thread = threading.Thread(
                     target=run_agent_background,
@@ -2020,6 +2295,7 @@ def index():
         mode=mode,
         running=running,
         file_plan=file_plan,
+        approval_pending=approval_pending,
         diff_text=diff_text,
         diff_state=diff_state,
         diff_title=diff_title,
@@ -2175,6 +2451,7 @@ def rollback_route():
         mode=mode,
         running=running,
         file_plan=None,
+        approval_pending=has_pending_approval(),
         diff_text=diff_text,
         diff_state=diff_state,
         diff_title=diff_title,
@@ -2308,6 +2585,9 @@ def status_route():
             progress=agent_progress[-40:],
             running=is_agent_running(),
             last_result=strip_think_tags(last_result),
+            # فقط خواندن وضعیت Pending Action برای نمایش
+            # دکمه‌های تأیید/لغو؛ هیچ تغییری ایجاد نمی‌کند.
+            pending_approval=has_pending_approval(),
             provider=runtime_info["provider"],
             model=runtime_info["model"],
             started_at=runtime_info["started_at"],
