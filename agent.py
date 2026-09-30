@@ -8067,6 +8067,73 @@ def clip_text(text, limit=MAX_TOOL_TEXT_CHARS):
     return text[:limit] + "\n… (متن کوتاه شد)"
 
 
+# ---------------------------------------------------------
+# ثبت خطای Agentic Loop (بدون تغییر در رفتار fallback)
+# ---------------------------------------------------------
+# آخرین خطایی که باعث رفتن از Agentic Loop به Legacy شد.
+# فقط برای مشاهده و عیب‌یابی؛ در مسیر تصمیم‌گیری هیچ
+# نقشی ندارد و هیچ رفتاری را تغییر نمی‌دهد.
+LAST_LOOP_FAILURE = None
+
+
+def record_agentic_loop_failure(
+    user_request,
+    project_name,
+    exc_info=None,
+):
+    # خطای حلقه را ثبت می‌کند تا شکست پنهان نماند.
+    #
+    # سه قاعده:
+    #   1) هرگز استثنا پرتاب نمی‌کند (ثبت نباید fallback
+    #      را خراب کند).
+    #   2) اطلاعات حساس درخواست کاربر را لاگ نمی‌کند؛ فقط
+    #      نوع خطا و پیامش.
+    #   3) مسیر fallback و Safety دست‌نخورده می‌ماند.
+    global LAST_LOOP_FAILURE
+
+    error = None
+
+    try:
+        if exc_info:
+            error = exc_info[1]
+        else:
+            error = sys.exc_info()[1]
+
+        if error is None:
+            return None
+
+        entry = {
+            "project": project_name,
+            "error_type": type(error).__name__,
+            "error": clip_text(str(error), 200),
+        }
+
+        LAST_LOOP_FAILURE = entry
+
+        # لاگ در stderr؛ همان الگویی که شاخه‌ی Multi-Agent
+        # از قبل استفاده می‌کند.
+        print(
+            "[agentic-loop] failed; falling back to legacy: "
+            "%s: %s" % (entry["error_type"], entry["error"]),
+            file=sys.stderr,
+        )
+
+        return entry
+
+    except Exception:
+        # ثبت خطا هرگز نباید خودش خطای جدید بسازد.
+        return None
+
+
+def get_last_loop_failure():
+    # فقط خواندن برای UI/عیب‌یابی؛ کپی برگردانده می‌شود
+    # تا caller نتواند منبع را تغییر دهد.
+    if not isinstance(LAST_LOOP_FAILURE, dict):
+        return None
+
+    return dict(LAST_LOOP_FAILURE)
+
+
 # تعداد خطوطی که قبل و بعد از هر خط سیگنال حفظ می‌شوند.
 REVIEW_SIGNAL_CONTEXT_LINES = 12
 
@@ -8080,6 +8147,13 @@ REVIEW_MULTI_FILE_CLIP_FACTOR = 2
 # حداکثر دفعاتی که Agent می‌تواند مدل را یادآوری کند که قبل
 # از FINAL باید فایل دارای بالاترین سیگنال را بخواند.
 MAX_EVIDENCE_NUDGES = 1
+
+# سقف تلاش با «نام ابزار نامعتبر».
+#
+# این خطا گام مصرف نمی‌کند (چون هیچ ابزاری اجرا نشده)، بنابراین
+# سقف کوچک و مستقلی می‌خواهد تا حلقه در برابر مدلی که پیوسته
+# نام غلط می‌فرستد بی‌نهایت نچرخد.
+MAX_INVALID_TOOL_RETRIES = 2
 
 # برای برش هوشمند فقط الگوهای قوی/قابلیت‌محور به کار می‌روند.
 # الگوهای تأییدی مثل external-url روی تقریباً هر فایل PHP
@@ -9041,23 +9115,63 @@ MUTATING_TOOLS = tuple(
 )
 
 
+def suggest_tool_name(unknown_name):
+    # نزدیک‌ترین نام معتبر را پیشنهاد می‌دهد تا مدل به‌جای
+    # تکرار خطای یکسان، نام درست را یاد بگیرد.
+    #
+    # این «alias» نیست: هیچ ابزاری به نام اشتباه اجرا نمی‌شود.
+    # فقط یک پیشنهاد متنی به مدل داده می‌شود و تصمیم با خود
+    # مدل است. اگر نام دقیقاً در Registry باشد همان برگردانده
+    # می‌شود.
+    if not isinstance(unknown_name, str):
+        return None
+
+    name = unknown_name.strip()
+    if not name:
+        return None
+
+    # پسوند/پیشوند رایج مدل‌های محلی هم در نظر گرفته می‌شود
+    # تا «edit» به «edit_file» و «write» به «write_file» برسد.
+    for candidate in TOOL_REGISTRY:
+        if name == candidate:
+            return candidate
+
+    matches = difflib.get_close_matches(
+        name,
+        list(TOOL_REGISTRY.keys()),
+        n=1,
+        cutoff=0.6,
+    )
+
+    if matches:
+        return matches[0]
+
+    return None
+
+
 def build_tool_reference():
     # متن راهنمای ابزارها برای مدل؛ از همان Registry ساخته
     # میشود تا هرگز با فهرست سفید اختلاف نداشته باشد.
-    lines = []
+    #
+    # نام‌ها با تیتر جدا و صریح اعلام می‌شوند تا مدل‌های محلی
+    # که نام ابزار را از پیش‌آموزش خود می‌آورند (مثل «edit»
+    # به‌جای «edit_file») به سمت نام‌های دقیق هدایت شوند.
+    lines = [
+        "AVAILABLE TOOL NAMES (use EXACTLY these, nothing else):",
+    ]
 
     for name, spec in TOOL_REGISTRY.items():
-        marker = " [نیازمند تأیید]" if spec["mutating"] else ""
+        marker = " [needs approval]" if spec["mutating"] else ""
+        lines.append("- " + name + marker)
+        lines.append("    ARGS: " + spec["usage"])
+        lines.append("    -> " + spec["description"])
 
-        lines.append(
-            "- "
-            + name
-            + marker
-            + " ARGS: "
-            + spec["usage"]
-            + " → "
-            + spec["description"]
-        )
+    lines.append("")
+    lines.append(
+        "A tool name that is not in the list above does not exist. "
+        "If you need to change a file, use edit_file (not 'edit'). "
+        "Never invent or abbreviate a tool name."
+    )
 
     return "\n".join(lines)
 
@@ -9289,6 +9403,21 @@ def prior_successful_same_action(
     return None
 
 
+def plan_requires_approval(allow_write):
+    # تنها منبع حقیقت برای این پرسش: «آیا این Plan واقعاً
+    # نیازمند تأیید کاربر است؟»
+    #
+    # شرط عمداً همان شرط سخت‌گیرانه‌ی is_write_allowed است که
+    # Gate تأیید و handle_pending_action_request استفاده می‌کنند.
+    # قبلاً build_pending_plan_text از truthiness ساده استفاده
+    # می‌کرد، بنابراین یک مقدار truthy-but-not-True (مثل 1 یا
+    # "write") متن «برای اجرا پاسخ دهید: تأیید» را چاپ می‌کرد
+    # در حالی که Gate آن را رد می‌کرد و Pending Action ساخته
+    # نمی‌شد؛ یعنی کاربر دستور تأییدی می‌دید که وجود نداشت.
+    # Fail Closed: فقط boolean True واقعاً مجاز است.
+    return is_write_allowed(allow_write)
+
+
 def build_pending_plan_text(
     tool_name,
     args,
@@ -9342,7 +9471,10 @@ def build_pending_plan_text(
 
     lines.append("")
 
-    if write_mode:
+    # شرط سخت‌گیرانه: فقط وقتی واقعاً مجاز است که Gate هم
+    # تأیید را بپذیرد. truthiness ساده می‌توانست دستور تأییدِ
+    # بی‌پشتوانه نشان دهد.
+    if plan_requires_approval(write_mode):
         lines.append("برای اجرا پاسخ دهید: تأیید")
         lines.append("برای لغو پاسخ دهید: لغو")
     else:
@@ -9889,7 +10021,8 @@ def build_loop_report(
     transcript,
     final_answer=None,
     pending_plan=None,
-    notes=None
+    notes=None,
+    plan_needs_approval=True
 ):
     # Report یکنواخت حلقه Agentic.
     lines = [
@@ -9972,7 +10105,16 @@ def build_loop_report(
 
     if pending_plan:
         lines.append("")
-        lines.append("Plan پیشنهادی (نیازمند تأیید):")
+
+        # عنوان فقط وقتی «نیازمند تأیید» است که واقعاً یک
+        # Pending Action ساخته شده باشد. در غیر این صورت
+        # عنوان فریبنده بود: کاربر فکر می‌کرد باید «تأیید»
+        # بفرستد در حالی که چنین Pendingی وجود ندارد.
+        if plan_needs_approval:
+            lines.append("Plan پیشنهادی (نیازمند تأیید):")
+        else:
+            lines.append("Plan پیشنهادی:")
+
         lines.append(pending_plan)
 
     if notes:
@@ -10670,6 +10812,10 @@ def run_loop_steps(
     rejections = []
     duplicate_blocks = 0
     evidence_nudges = 0
+    # شمارنده‌ی خطای «نام ابزار نامعتبر». این خطا گام مصرف
+    # نمی‌کند، پس برای جلوگیری از چرخش بی‌نهایت سقف جداگانه
+    # و کوچک دارد.
+    invalid_tool_retries = 0
     pending_evidence_path = top_priority_signal_path(project_root)
 
     while steps_used < max_steps:
@@ -10785,12 +10931,53 @@ def run_loop_steps(
         spec = TOOL_REGISTRY.get(tool_name)
 
         if spec is None:
-            observations.append(
-                "ابزار نامعتبر: "
+            # ابزار نامعتبر یک «پیشرفت» نیست، پس نباید بودجه‌ی
+            # گام را مصرف کند. این گام هرگز هیچ ابزاری را اجرا
+            # نکرده و هیچ اطلاعات تازه‌ای تولید نکرده است.
+            #
+            # سقف کوتاهی هم نگه داشته می‌شود تا حلقه در برابر
+            # مدلی که بی‌نهایت نام غلط می‌فرستد بی‌نهایت نچرخد.
+            invalid_tool_retries += 1
+
+            observation = (
+                "نام ابزار نامعتبر است: «"
                 + str(tool_name)
-                + " — ابزارهای مجاز: "
+                + "». چنین ابزاری وجود ندارد و هیچ چیز اجرا "
+                "نشد. نام‌های مجاز: "
                 + ", ".join(TOOL_REGISTRY.keys())
+                + "."
             )
+
+            suggestion = suggest_tool_name(tool_name)
+
+            if suggestion:
+                observation += (
+                    " احتمالاً منظورت «"
+                    + suggestion
+                    + "» بود؛ همین نام را دقیقاً استفاده کن."
+                )
+
+            observations.append(observation)
+
+            if invalid_tool_retries > MAX_INVALID_TOOL_RETRIES:
+                # مدل پیوسته نام غلط می‌فرستد؛ ادامه فایده‌ای
+                # ندارد و فقط بودجه را می‌بلعد.
+                return build_loop_report(
+                    project_name,
+                    project_root,
+                    transcript,
+                    notes=[
+                        "پس از "
+                        + str(invalid_tool_retries)
+                        + " تلاش با نام ابزار نامعتبر، حلقه متوقف "
+                        "شد؛ هیچ ابزاری اجرا نشد.",
+                        "نام‌های مجاز: "
+                        + ", ".join(TOOL_REGISTRY.keys()),
+                    ]
+                )
+
+            # گام واقعی مصرف نمی‌شود؛ مدل فرصت اصلاح دارد.
+            steps_used -= 1
 
             continue
 
@@ -10885,11 +11072,16 @@ def run_loop_steps(
                 )
 
                 if not is_write_allowed(allow_write):
+                    # هیچ Pending Action ساخته نمی‌شود، پس عنوان
+                    # «نیازمند تأیید» هم نباید نمایش داده شود؛
+                    # در غیر این صورت کاربر دستور تأییدی می‌بیند
+                    # که Pendingی پشت آن وجود ندارد.
                     return build_loop_report(
                         project_name,
                         project_root,
                         transcript,
                         pending_plan=plan_text,
+                        plan_needs_approval=False,
                         notes=[
                             "عملیات تغییردهنده در حالت "
                             "«فقط بررسی» اجرا نمیشود؛ "
@@ -11996,7 +12188,18 @@ def run_agent(
             # Agentic Loop هرگز نباید مسیرهای تستشده را
             # خراب کند؛ در صورت خطای غیرمنتظره، اجرای
             # معمولی ادامه پیدا میکند.
-            pass
+            #
+            # اما خطا نباید کاملاً بی‌صدا باشد: در غیر این
+            # صورت شکست حلقه کاملاً پنهان می‌شد و تشخیص آن
+            # ممکن نبود. رفتار کنترل جریان دقیقاً مثل قبل
+            # است (fallback حفظ می‌شود و خطا دوباره raise
+            # نمی‌شود)؛ فقط خطا ثبت و از مسیر جاری خارج
+            # می‌شود.
+            record_agentic_loop_failure(
+                user_request,
+                project_name,
+                sys.exc_info(),
+            )
 
     try:
         result = run_agent_legacy(
