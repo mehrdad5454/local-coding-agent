@@ -11024,8 +11024,27 @@ def read_paths_already_seen(transcript):
     return seen
 
 
+def normalize_known_read_paths(known_read_paths):
+    # مسیرهای خوانده‌شده‌ای که از چرخهٔ قبلی به این چرخه منتقل
+    # می‌شوند، با همان normalizer رسمیِ پروژه یکسان‌سازی
+    # می‌شوند تا با سمتِ هدف و با read_paths_already_seen دقیقاً
+    # هم‌شکل باشند («./» و «\» و بزرگی/کوچکی حروف یکسان شود).
+    normalized = set()
+
+    for value in known_read_paths or []:
+        if not isinstance(value, str):
+            continue
+
+        item = normalize_relative_target(value)
+
+        if item:
+            normalized.add(item)
+
+    return normalized
+
+
 def ensure_edit_file_proposal_is_grounded(
-    project_root, args, transcript
+    project_root, args, transcript, known_read_paths=None
 ):
     # پیش‌شرط ساخت Plan برای edit_file (خواندن + محتوای واقعی).
     #
@@ -11037,9 +11056,15 @@ def ensure_edit_file_proposal_is_grounded(
     # (یعنی دیرهنگام) شکست می‌خورد.
     #
     # این تابع دقیقاً همان دو شکست را می‌بندد:
-    #   A) فایل هدف باید قبلاً در همین حلقه با read_file /
-    #      read_files خوانده شده باشد.
+    #   A) فایل هدف باید قبلاً در همین درخواست خوانده شده باشد.
     #   C) رشتهٔ `old` باید واقعاً داخل محتوای فعلی همان فایل باشد.
+    #
+    # known_read_paths مسیرهایی است که در چرخهٔ قبلیِ همین
+    # درخواست (پیش از Approval) واقعاً خوانده شده‌اند و هنگام
+    # Resume منتقل می‌شوند. این کار فقط «سابقهٔ خواندن» را حمل
+    # می‌کند و invariant را تغییر نمی‌دهد: شرط C همچنان محتوای
+    # واقعیِ فعلی فایل را می‌سنجد، پس یک مسیرِ منتقل‌شده هرگز
+    # اجازهٔ ویرایشِ بدون مبنا نمی‌دهد.
     #
     # این بررسی فقط برای edit_file و فقط در حالت Write است.
     # در حالت فقط‌خواندنی هیچ تغییری رخ نمی‌دهد، پس مسیر موجود
@@ -11057,7 +11082,13 @@ def ensure_edit_file_proposal_is_grounded(
     if not normalized:
         return
 
-    if normalized not in read_paths_already_seen(transcript):
+    if normalized not in (
+        {
+            normalize_relative_target(item)
+            for item in read_paths_already_seen(transcript)
+        }
+        | normalize_known_read_paths(known_read_paths)
+    ):
         raise ValueError(
             "قبل از پیشنهاد ویرایش روی «" + str(path) + "»، باید "
             "همین فایل را با read_file بخوانی. بدون محتوای واقعی "
@@ -11332,7 +11363,8 @@ def run_loop_steps(
     max_steps=MAX_AGENT_STEPS,
     stop_event=None,
     progress=None,
-    known_request_status=None
+    known_request_status=None,
+    known_read_paths=None
 ):
     # هسته حلقه:
     # مدل یک گام را انتخاب میکند → Agent همان ابزار را
@@ -11343,6 +11375,12 @@ def run_loop_steps(
     # در چرخه‌های Approval قبلی ثبت شده و اینجا به حلقه باز
     # گشته است. بدون آن، هر Resume یک transcript تازه می‌سازد
     # و تغییرات موفقِ قبلی از گزارش ناپدید می‌شوند.
+    #
+    # known_read_paths: مسیرهایی که در چرخهٔ قبلیِ همین درخواست
+    # واقعاً با read_file / read_files خوانده شده‌اند. چون هر
+    # Resume یک transcript تازه می‌سازد، بدون این کلید Readهای
+    # واقعیِ همان درخواست فراموش می‌شدند و ویرایشِ درستِ فایل
+    # دوم (مثل style.css) به‌اشتباه رد می‌شد.
     system_prompt = build_loop_system_prompt()
     rejections = []
     duplicate_blocks = 0
@@ -11691,7 +11729,8 @@ def run_loop_steps(
                 if tool_name == "edit_file" and is_write_allowed(allow_write):
                     try:
                         ensure_edit_file_proposal_is_grounded(
-                            project_root, args, transcript
+                            project_root, args, transcript,
+                            known_read_paths=known_read_paths
                         )
 
                     except Exception as e:
@@ -11757,6 +11796,23 @@ def run_loop_steps(
                         user_request,
                         transcript,
                         known_request_status
+                    ),
+                    # Readهای واقعیِ همین درخواست تا این لحظه
+                    # (additive). چون هر Resume یک transcript تازه
+                    # می‌سازد، بدون این کلید Readهای پیش از Approval
+                    # گم می‌شدند و ویرایشِ فایل بعدیِ همان درخواست
+                    # (مثل style.css) به‌اشتباه «بدون Read قبلی»
+                    # رد می‌شد. فقط سابقهٔ خواندن را حمل می‌کند و
+                    # شرط محتوای واقعیِ old را تغییر نمی‌دهد.
+                    "read_paths": sorted(
+                        normalize_relative_target(item)
+                        for item in (
+                            read_paths_already_seen(transcript)
+                            | normalize_known_read_paths(
+                                known_read_paths
+                            )
+                        )
+                        if str(item)
                     ),
                     # Phase B: مشخصات Plan برای Re-validation
                     # قبل از Execute (additive؛ نسخه قدیمی این
@@ -12147,6 +12203,17 @@ def execute_pending_action(stop_event=None):
         1, tool_name, args, result, True
     )
 
+    # Readهای همین درخواست که پیش از Approval انجام شده‌اند با
+    # Resume حمل می‌شوند. transcript تازه فقط Mutation را دارد، پس
+    # بدون این کار یک ویرایشِ درستِ فایل بعدی (که قبلاً در همین
+    # چرخه خوانده شده) به‌اشتباه «بدون Read قبلی» رد می‌شد.
+    # این فقط سابقهٔ خواندن است؛ شرط محتوای واقعیِ old در
+    # ensure_edit_file_proposal_is_grounded دست‌نخورده می‌ماند.
+    resume_read_paths = pending.get("read_paths")
+
+    if not isinstance(resume_read_paths, list):
+        resume_read_paths = []
+
     return run_loop_steps(
         user_request=pending.get("user_request") or "",
         project_root=project_root,
@@ -12164,7 +12231,8 @@ def execute_pending_action(stop_event=None):
             pending.get("request_status")
             if isinstance(pending.get("request_status"), dict)
             else None
-        )
+        ),
+        known_read_paths=resume_read_paths
     )
 
 
@@ -12510,6 +12578,13 @@ def handle_agent_batch_proposal(
             "project": project_name,
             "project_root": project_root,
             "user_request": user_request,
+            # Readهای واقعیِ همین درخواست تا این لحظه (additive)،
+            # مثل Step 1. این کار فقط سابقهٔ خواندن را حمل می‌کند.
+            "read_paths": sorted(
+                normalize_relative_target(item)
+                for item in read_paths_already_seen(entries)
+                if str(item)
+            ),
             "context": build_pending_revalidation_context(
                 tool_name,
                 proposal_args,
