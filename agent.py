@@ -8179,6 +8179,14 @@ MAX_EVIDENCE_NUDGES = 1
 # زود FINAL بنویسد، گزارش وضعیت واقعی را نشان می‌دهد.
 MAX_COMPLETION_NUDGES = 1
 
+# حداکثر دفعاتی که Agent یادآوری می‌کند یک Mutation پیشنهادی
+# همهٔ فایل‌های مرتبطِ درخواست را پوشش نداده است.
+#
+# این یادآوری کاملاً advisory است: فقط یک‌بار در کل حلقه، فقط
+# وقتی coverage قطعی باشد. مدل آزاد است نادیده بگیرد و Plan
+# خودش را ارائه کند، پس هرگز باعث توقف دائمی نمی‌شود.
+MAX_COVERAGE_NUDGES = 1
+
 # سقف تلاش با «نام ابزار نامعتبر».
 #
 # این خطا گام مصرف نمی‌کند (چون هیچ ابزاری اجرا نشده)، بنابراین
@@ -9735,6 +9743,31 @@ def build_pending_plan_text(
             + content.strip()[:120].replace("\n", " ")
         )
 
+    if tool_name == "write_files":
+        # کاربر باید قبل از تأیید دقیقاً ببیند کدام فایل‌ها
+        # قرار است تغییر کنند؛ بدون این، Plan چندفایلی فقط نام
+        # ابزار را نشان می‌داد و محتوای قابل تأییدی نداشت.
+        try:
+            batch_paths = [
+                str(item.get("path"))
+                for item in normalize_batch_files(args)
+            ]
+        except Exception:
+            batch_paths = []
+
+        if batch_paths:
+            lines.append("فایل‌های پیشنهادی:")
+
+            for batch_path in batch_paths:
+                lines.append("- " + batch_path)
+
+            lines.append(
+                "این "
+                + str(len(batch_paths))
+                + " فایل با هم و با یک تأیید نوشته می‌شوند؛ "
+                "شکست هر فایل باعث rollback همه می‌شود."
+            )
+
     if tool_name == "edit_file":
         old_text = str(
             tool_arg(args, "old", "old_text", "find", "search") or ""
@@ -11147,7 +11180,33 @@ PROJECT_INVENTORY_SKIP_SUFFIXES = (
     ".agent-backup",
 )
 
+PROJECT_INVENTORY_BACKUP_MARKER = ".agent-backup"
+
 MAX_PROJECT_INVENTORY_FILES = 60
+
+
+def is_project_backup_file(name):
+    # فایل‌های Backup که خودِ ابزار می‌سازد: «name.agent-backup»
+    # و نسخه‌های شماره‌دار آن مثل «name.agent-backup.1».
+    #
+    # این‌ها پشتوانهٔ تغییرات گذشته‌اند، نه فایل پروژه. اگر وارد
+    # Inventory شوند، مدل آن‌ها را هدف تغییر می‌گیرد و کاربر
+    # یک Plan اشتباه می‌بیند. این بررسی فقط برای Inventory است و
+    # رفتار هیچ مسیر دیگری را تغییر نمی‌دهد.
+    text = str(name or "")
+    index = text.find(PROJECT_INVENTORY_BACKUP_MARKER)
+
+    if index < 0:
+        return False
+
+    tail = text[index + len(PROJECT_INVENTORY_BACKUP_MARKER):]
+
+    if not tail:
+        return True
+
+    # فقط نسخهٔ شماره‌دار («.agent-backup.1» یا «.agent-backup.12»)
+    # تا نامی مثل «my.agent-backup-guide.txt» اشتباهی حذف نشود.
+    return bool(re.fullmatch(r"\.\d+", tail))
 
 
 def build_project_file_inventory(project_root, max_files=None):
@@ -11187,6 +11246,9 @@ def build_project_file_inventory(project_root, max_files=None):
             if name.endswith(PROJECT_INVENTORY_SKIP_SUFFIXES):
                 continue
 
+            if is_project_backup_file(name):
+                continue
+
             full = os.path.join(current, name)
             relative = os.path.relpath(full, project_root)
 
@@ -11222,6 +11284,235 @@ def build_project_file_inventory(project_root, max_files=None):
     )
 
     return "\n".join(lines)
+
+
+COVERAGE_DOC_EXTENSIONS = (
+    ".md", ".markdown", ".rst", ".txt", ".pdf",
+)
+
+COVERAGE_STYLESHEET_LINK_PATTERN = re.compile(
+    r"""<link\b[^>]*\brel\s*=\s*["']?stylesheet["']?[^>]*>""",
+    re.IGNORECASE,
+)
+
+COVERAGE_HREF_PATTERN = re.compile(
+    r"""href\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+COVERAGE_IMPORT_PATTERN = re.compile(
+    r"""(?:@import\s+|import\s+)(?:url\()?["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+COVERAGE_CLASS_PATTERN = re.compile(
+    r"""class\s*=\s*["'][^"']*?\b([A-Za-z_][\w\-]*)""",
+    re.IGNORECASE,
+)
+
+
+def project_inventory_paths(project_root):
+    # مسیرهای واقعی Inventory، به‌صورت فهرست ساده.
+    # فقط ورودی‌هایی که واقعاً روی دیسک هستند نگه داشته
+    # می‌شوند تا جمله‌های راهنمای انتهای Inventory (که با «- »
+    # شروع می‌شوند) به‌اشتباه مسیر شمرده نشوند.
+    text = build_project_file_inventory(project_root)
+
+    paths = []
+
+    for line in (text or "").splitlines():
+        item = line.strip()
+
+        if not item.startswith("- "):
+            continue
+
+        value = item[2:].strip()
+
+        if not value or value.startswith("("):
+            continue
+
+        if not os.path.isfile(os.path.join(project_root, value)):
+            continue
+
+        if value not in paths:
+            paths.append(value)
+
+    return paths
+
+
+def related_project_files(project_root, user_request):
+    # فایل‌های «احتمالاً مرتبط» با یک درخواست طبیعی.
+    #
+    # ریشه‌ی مشکل «style.css هرگز وارد Plan نمی‌شود»:
+    # find_requested_files فقط با یک توکن «name.ext» کار می‌کند،
+    # پس درخواستی مثل «عنوان h1 آبی باشد و پاراگراف با کلاس .text
+    # خاکستری باشد» هیچ فایلی تولید نمی‌کرد و در نتیجه هیچ
+    # Coverageای هم وجود نداشت.
+    #
+    # این تابع کمکی و فقط‌خواندنی است:
+    #   * فقط وقتی درخواست هیچ نام فایل صریحی ندارد فعال می‌شود،
+    #     پس رفتار درخواست‌های تک‌فایلیِ فعلی کاملاً حفظ می‌شود.
+    #   * سیگنال اصلی، «گراف ارجاع» است: اگر یک فایلِ مرتبط،
+    #     فایل دیگری از پروژه را بارگذاری کند (مثلاً <link
+    #     rel="stylesheet" href="style.css"> یا @import) آن فایل
+    #     دوم هم مرتبط است.
+    #   * تطبیق selector/class فقط سیگنال کمکی است.
+    #   * فایل‌های مستندات (README و مشابه) هرگز صرفاً به خاطر
+    #     وجود کلمه‌ای مثل «html» نامزد نمی‌شوند.
+    #   * اگر اطمینان کافی نباشد، خروجی خالی است.
+    #
+    # این تابع هرگز Mutation انجام نمی‌دهد، Plan نمی‌سازد و
+    # فقط پیشنهاد candidate می‌دهد.
+    if not project_root or not os.path.isdir(project_root):
+        return []
+
+    # درخواستی که خودش نام فایل داده، مسیر قطعیِ خودش را دارد.
+    try:
+        if extract_file_candidates(user_request):
+            return []
+
+    except Exception:
+        return []
+
+    paths = project_inventory_paths(project_root)
+
+    if len(paths) < 2:
+        return []
+
+    request_text = normalize_request_text(user_request)
+    by_name = {}
+
+    for path in paths:
+        by_name[path.replace("\\", "/").strip("/").lower()] = path
+
+    contents = {}
+
+    for path in paths:
+        full = os.path.join(project_root, path)
+
+        if not os.path.isfile(full):
+            continue
+
+        try:
+            with open(full, "r", encoding="utf-8") as fh:
+                contents[path] = fh.read()
+
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    if not contents:
+        return []
+
+    # نامزدهای اولیه: فایل‌هایی که selector یا کلاسِ نام‌بردهٔ
+    # درخواست را واقعاً در محتوای خود دارند.
+    seeds = set()
+
+    for path, content in contents.items():
+        lower = path.lower()
+
+        if lower.endswith(COVERAGE_DOC_EXTENSIONS):
+            # مستندات نامزد نمی‌شوند.
+            continue
+
+        body = content.lower()
+
+        if "." in request_text:
+            for match in COVERAGE_CLASS_PATTERN.finditer(content):
+                token = match.group(1).lower()
+
+                if token and token in request_text:
+                    seeds.add(path)
+                    break
+
+        for match in re.finditer(r"[`\"']([.#]?[A-Za-z_][\w\-]*)[`\"']",
+                                 user_request or ""):
+            token = match.group(1).lower()
+            bare = token.lstrip(".")
+
+            if not bare or len(bare) < 2:
+                continue
+
+            if bare in body:
+                seeds.add(path)
+                break
+
+    if not seeds:
+        return []
+
+    # گراف ارجاع: هر فایلی که یکی از seedها آن را در
+    # <link rel="stylesheet"> یا @import/import صدا می‌زند.
+    related = set(seeds)
+
+    for path in list(seeds):
+        content = contents.get(path) or ""
+        targets = []
+
+        if COVERAGE_STYLESHEET_LINK_PATTERN.search(content):
+            targets.extend(COVERAGE_HREF_PATTERN.findall(content))
+
+        targets.extend(COVERAGE_IMPORT_PATTERN.findall(content))
+
+        for raw in targets:
+            token = str(raw or "").split("?")[0].split("#")[0].strip()
+            token = token.replace("\\", "/").lstrip("./")
+            target = by_name.get(token.lower())
+
+            if target and target in contents:
+                related.add(target)
+
+    # بیش از دو نامزد یعنی اطمینان پایین است؛ چیزی پیشنهاد
+    # نمی‌شود تا مدل بین گزینه‌های نامربوط سرگردان نشود.
+    if len(related) < 2 or len(related) > 2:
+        return []
+
+    return sorted(related)
+
+
+def uncovered_coverage_files(
+    project_root, user_request, tool_name, args, transcript,
+    known_read_paths=None
+):
+    # فایل‌های مرتبطی که Mutation پیشنهادی پوشش نداده است.
+    #
+    # کاملاً فقط‌خواندنی و کاملاً اختیاری: اگر coverage معتبری
+    # نباشد، خروجی خالی است و هیچ اتفاقی نمی‌افتد. این تابع
+    # هیچ تصمیمی نمی‌گیرد و فقط فهرست پیشنهاد می‌دهد؛ تصمیم‌گیری
+    # و ساخت Plan همچنان دست مدل می‌ماند.
+    if tool_name not in (
+        "write_file", "write_files", "edit_file"
+    ):
+        return []
+
+    try:
+        related = related_project_files(project_root, user_request)
+
+    except Exception:
+        return []
+
+    if len(related) < 2:
+        return []
+
+    if tool_name == "write_files":
+        try:
+            covered = {
+                normalize_relative_target(item.get("path"))
+                for item in normalize_batch_files(args)
+            }
+        except Exception:
+            return []
+
+    else:
+        path = tool_arg(args, "path", "relative_path", "file", "dir")
+
+        if not path:
+            return []
+
+        covered = {normalize_relative_target(path)}
+
+    return [
+        item for item in related
+        if normalize_relative_target(item) not in covered
+    ]
 
 
 def build_loop_project_facts(project_root):
@@ -11389,6 +11680,9 @@ def run_loop_steps(
     # evidence_nudges سقف کوتاه دارد تا حلقه هرگز در
     # چرخهٔ بی‌پایان گیر نکند.
     completion_nudges = 0
+    # شمارنده‌ی یادآوری «پوشش چندفایلی». advisory است و سقف
+    # یک‌باره دارد تا حلقه هرگز به‌خاطر آن قفل نشود.
+    coverage_nudges = 0
     # شمارنده‌ی خطای «نام ابزار نامعتبر». این خطا گام مصرف
     # نمی‌کند، پس برای جلوگیری از چرخش بی‌نهایت سقف جداگانه
     # و کوچک دارد.
@@ -11737,6 +12031,46 @@ def run_loop_steps(
                         observations.append(
                             "این گام رد شد (ویرایش بدون مبنای "
                             "واقعی): " + str(e)
+                        )
+
+                        continue
+
+                # Nudge پوشش چندفایلی (advisory).
+                #
+                # ریشه‌ی «style.css هرگز وارد Plan نمی‌شود»: در یک
+                # درخواست طبیعی، هیچ نام فایلی نوشته نشده، پس
+                # find_requested_files هیچ فایلی برنمی‌گرداند و
+                # هیچ Coverageای وجود ندارد. مدل Plan تک‌فایلی
+                # می‌سازد و کار تمام‌شده به نظر می‌رسد.
+                #
+                # این nudge «مشورتی» است، نه hard enforcement: فقط
+                # یک‌بار در کل حلقه، فقط وقتی coverage قطعی است، و
+                # فقط وقتی Plan همهٔ فایل‌های مرتبط را پوشش نداده
+                # باشد. حلقه `continue` می‌کند و مدل فرصت دارد پس
+                # از خواندن و ارائهٔ Plan کامل ادامه دهد؛ هرگز
+                # اجبار دائمی یا توقف ناگهانی وجود ندارد.
+                if (
+                    coverage_nudges < MAX_COVERAGE_NUDGES
+                    and steps_used < max_steps
+                    and is_write_allowed(allow_write)
+                ):
+                    uncovered = uncovered_coverage_files(
+                        project_root, user_request, tool_name,
+                        args, transcript, known_read_paths
+                    )
+
+                    if uncovered:
+                        coverage_nudges += 1
+                        observations.append(
+                            "پوشش کار ناقص است: فایل "
+                            + "، ".join(uncovered)
+                            + " هم به این درخواست مربوط است ولی "
+                            "در Mutation پیشنهادی نیامده. قبل از "
+                            "ساخت Plan این فایل‌ها را با read_file "
+                            "بخوان، سپس همهٔ فایل‌های لازم را در "
+                            "یک Plan کامل بیاور (برای چند فایل از "
+                            "write_files استفاده کن تا یک تأیید "
+                            "کافی باشد)."
                         )
 
                         continue

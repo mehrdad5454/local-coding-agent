@@ -63,6 +63,24 @@ INDEX_HTML = (
 
 STYLE_CSS = "h1 {\n  color: black;\n}\n\n.text {\n  color: black;\n}\n"
 
+NEW_INDEX_HTML = (
+    "<!DOCTYPE html>\n"
+    "<html lang=\"fa\">\n"
+    "<head>\n"
+    "  <meta charset=\"utf-8\">\n"
+    "  <title>Local Agent Demo</title>\n"
+    "  <link rel=\"stylesheet\" href=\"style.css\">\n"
+    "</head>\n"
+    "<body>\n"
+    "  <h1>Local Agent Demo</h1>\n"
+    "  <p class=\"text\">This page is used to test the Local Coding "
+    "Agent.</p>\n"
+    "</body>\n"
+    "</html>\n"
+)
+
+NEW_STYLE_CSS = "h1 {\n  color: blue;\n}\n\n.text {\n  color: gray;\n}\n"
+
 
 def check(name, condition, detail=""):
     ok = bool(condition)
@@ -188,19 +206,197 @@ def test_real_targets_are_accepted(temp_root):
             reason = safe(e)
 
         check("PLAN: real target accepted -> " + target, accepted, reason)
-
-        run_loop([
-            ("read_file", {"path": target}),
-            ("edit_file", {"path": target, "old": old, "new": new}),
-        ], temp_root, max_steps=3)
-
-        targets = pending_targets()
-        check(
-            "PLAN: pending plan built for " + target,
-            target in targets,
-            safe(targets),
-        )
         agent.clear_pending_action()
+
+
+def test_multi_file_coverage_plan(temp_root):
+    # 2) سناریوی واقعی گزارش‌شده:
+    #    درخواست طبیعی بدون هیچ نام فایل، ظاهر صفحه را هم می‌خواهد،
+    #    پس Plan تک‌فایلی ناقص است.
+    #
+    #    ترتیب مورد انتظار:
+    #      a) related_project_files هر دو فایل را تشخیص می‌دهد
+    #      b) مدل اول فقط index.html را پیشنهاد می‌دهد
+    #      c) nudge پوشش چندفایلی یک‌باره اجرا می‌شود
+    #      d) مدل بعد از nudge هر دو فایل را می‌خواند
+    #      e) یک Plan چندفایلی شامل هر دو فایل ساخته می‌شود
+    agent.clear_pending_action()
+
+    related = agent.related_project_files(temp_root, REAL_REQUEST)
+    check(
+        "COVERAGE: index.html detected as related",
+        "index.html" in related,
+        safe(related),
+    )
+    check(
+        "COVERAGE: style.css detected as related",
+        "style.css" in related,
+        safe(related),
+    )
+    check(
+        "COVERAGE: README.txt is not related",
+        "README.txt" not in related,
+        safe(related),
+    )
+
+    _, observations, _ = run_loop([
+        # b) اول فقط فایل HTML
+        ("read_file", {"path": "index.html"}),
+        ("edit_file", {
+            "path": "index.html",
+            "old": "<title>Agent Test</title>",
+            "new": "<title>Local Agent Demo</title>",
+        }),
+        # d) بعد از nudge، هر دو فایل خوانده و یک Batch کامل
+        ("read_file", {"path": "style.css"}),
+        ("write_files", {"files": [
+            {"path": "index.html", "content": NEW_INDEX_HTML},
+            {"path": "style.css", "content": NEW_STYLE_CSS},
+        ]}),
+    ], temp_root, max_steps=8)
+
+    nudges = [
+        o for o in observations if "پوشش کار ناقص" in str(o)
+    ]
+    check(
+        "COVERAGE: nudge fired exactly once",
+        len(nudges) == 1,
+        safe(len(nudges)),
+    )
+    check(
+        "COVERAGE: nudge names the missing style.css",
+        any("style.css" in str(o) for o in nudges),
+        safe(nudges),
+    )
+    check(
+        "COVERAGE: both files were read after the nudge",
+        any(
+            "read_file" in str(o) and "style.css" in str(o)
+            for o in observations
+        ),
+        safe(observations),
+    )
+
+    pending = agent.get_pending_action() or {}
+    targets = pending_targets()
+
+    check(
+        "PLAN: pending plan covers index.html",
+        "index.html" in targets,
+        safe(targets),
+    )
+    check(
+        "PLAN: pending plan covers style.css",
+        "style.css" in targets,
+        safe(targets),
+    )
+    check(
+        "PLAN: one approval covers the whole batch",
+        pending.get("tool") == "write_files",
+        safe(pending.get("tool")),
+    )
+    agent.clear_pending_action()
+
+
+def test_write_files_plan_lists_every_path(temp_root):
+    # 3) کاربر باید پیش از تأیید دقیقاً ببیند کدام فایل‌ها تغییر
+    #    می‌کنند؛ Plan چندفایلی فقط نام ابزار را نشان نمی‌دهد.
+    text = agent.build_pending_plan_text(
+        "write_files",
+        {"files": [
+            {"path": "index.html", "content": NEW_INDEX_HTML},
+            {"path": "style.css", "content": NEW_STYLE_CSS},
+        ]},
+        temp_root,
+        write_mode=True,
+    )
+
+    check(
+        "PLAN TEXT: batch file list is shown",
+        "فایل‌های پیشنهادی:" in text,
+        safe(text),
+    )
+    check(
+        "PLAN TEXT: index.html is listed",
+        "- index.html" in text,
+        safe(text),
+    )
+    check(
+        "PLAN TEXT: style.css is listed",
+        "- style.css" in text,
+        safe(text),
+    )
+    check(
+        "PLAN TEXT: approval prompt still present",
+        "برای اجرا پاسخ دهید: تأیید" in text,
+        safe(text),
+    )
+
+
+def test_numbered_backups_stay_out_of_inventory(temp_root):
+    # 4) فایل‌های Backup پشتوانه، فایل پروژه نیستند و نباید
+    #    به‌عنوان هدفِ تغییر به مدل پیشنهاد شوند.
+    with open(
+        os.path.join(temp_root, "index.html.agent-backup.1"),
+        "w", encoding="utf-8",
+    ) as fh:
+        fh.write(INDEX_HTML)
+
+    paths = agent.project_inventory_paths(temp_root)
+
+    check(
+        "INVENTORY: numbered backup is excluded",
+        "index.html.agent-backup.1" not in paths,
+        safe(paths),
+    )
+    check(
+        "INVENTORY: real files are kept",
+        "index.html" in paths and "style.css" in paths,
+        safe(paths),
+    )
+    check(
+        "INVENTORY: backup name check is not over-broad",
+        agent.is_project_backup_file("index.html.agent-backup.1")
+        and not agent.is_project_backup_file("style.css")
+        and not agent.is_project_backup_file(
+            "my.agent-backup-guide.txt"
+        ),
+    )
+
+
+def test_single_file_request_is_unchanged(temp_root):
+    # 5) درخواستی که خودش نام فایل را می‌دهد، هیچ Coverageای
+    #    فعال نمی‌کند و رفتار تک‌فایلی قبلی کاملاً حفظ می‌شود.
+    explicit = "فقط رنگ متن .text را در style.css تغییر بده"
+
+    check(
+        "SINGLE-FILE: no coverage for an explicit filename",
+        agent.related_project_files(temp_root, explicit) == [],
+        safe(agent.related_project_files(temp_root, explicit)),
+    )
+
+    agent.clear_pending_action()
+
+    _, observations, _ = run_loop([
+        ("read_file", {"path": "style.css"}),
+        ("edit_file", {
+            "path": "style.css",
+            "old": "  color: black;",
+            "new": "  color: blue;",
+        }),
+    ], temp_root, request=explicit, max_steps=4)
+
+    check(
+        "SINGLE-FILE: plan still built for style.css",
+        "style.css" in pending_targets(),
+        safe(pending_targets()),
+    )
+    check(
+        "SINGLE-FILE: no coverage nudge is raised",
+        not any("پوشش کار ناقص" in str(o) for o in observations),
+        safe(observations),
+    )
+    agent.clear_pending_action()
 
 
 def test_edit_without_prior_read_is_blocked(temp_root):
@@ -494,6 +690,10 @@ def main():
 
     try:
         test_real_targets_are_accepted(temp_root)
+        test_multi_file_coverage_plan(temp_root)
+        test_write_files_plan_lists_every_path(temp_root)
+        test_numbered_backups_stay_out_of_inventory(temp_root)
+        test_single_file_request_is_unchanged(temp_root)
         test_edit_without_prior_read_is_blocked(temp_root)
         test_edit_with_fabricated_old_is_blocked(temp_root)
         test_guessed_path_never_becomes_a_plan(temp_root)
