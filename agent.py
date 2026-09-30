@@ -8173,6 +8173,12 @@ REVIEW_MULTI_FILE_CLIP_FACTOR = 2
 # از FINAL باید فایل دارای بالاترین سیگنال را بخواند.
 MAX_EVIDENCE_NUDGES = 1
 
+# حداکثر دفعاتی که Agent می‌تواند مدل را یادآوری کند که قبل
+# از FINAL باید فایل‌های نام‌بردهٔ درخواست را واقعاً تغییر
+# دهد و Verify کند. یک یادآوری کافی است؛ اگر مدل باز هم
+# زود FINAL بنویسد، گزارش وضعیت واقعی را نشان می‌دهد.
+MAX_COMPLETION_NUDGES = 1
+
 # سقف تلاش با «نام ابزار نامعتبر».
 #
 # این خطا گام مصرف نمی‌کند (چون هیچ ابزاری اجرا نشده)، بنابراین
@@ -9361,6 +9367,135 @@ def is_correction_of_failed_mutation(tool_name, args, transcript):
     )
 
 
+def normalize_relative_target(path):
+    # یکسان‌سازی مسیر برای مقایسه: جداکننده، حروف کوچک و
+    # نبودِ «./» یا «/» ابتدایی. فقط شکل مسیر را یکسان
+    # می‌کند و به هیچ فایلی دست نمی‌زند.
+    text = str(path or "").strip().replace("\\", "/")
+
+    while text.startswith("./"):
+        text = text[2:]
+
+    return text.strip("/").lower()
+
+
+def mutation_targets_of_entry(entry):
+    # مسیرهایی که یک گام Mutation واقعاً روی آن‌ها اجرا شده.
+    target = primary_target(
+        entry.get("tool"), entry.get("args") or {}
+    )
+
+    targets = []
+
+    for part in str(target or "").split("|"):
+        normalized = normalize_relative_target(part)
+
+        if normalized and normalized not in targets:
+            targets.append(normalized)
+
+    return targets
+
+
+def request_asks_for_mutation(user_request):
+    # آیا متن درخواست اصلاً یک عمل تغییردهنده خواسته است؟
+    # برای درخواست‌های تحلیلی/گفتگویی این قاعده خاموش
+    # می‌ماند تا گزارش شلوغ و بی‌معنا نشود.
+    text = normalize_request_text(user_request)
+
+    if not text.strip():
+        return False
+
+    return any(
+        keyword_matches_text(keyword, text)
+        for keyword in ACTION_VERB_KEYWORDS
+    )
+
+
+def requested_mutation_status(
+    project_root, user_request, transcript, known=None
+):
+    # وضعیت واقعی هر فایلِ نام‌برده در درخواست، فقط بر پایهٔ
+    # عملیات واقعاً اجراشده.
+    #
+    # این تابع تنها منبع حقیقتِ گزارش نهایی است: نه متن FINAL
+    # مدل و نه نیت کاربر. یک فایل «verified» است فقط وقتی که
+    # یک گام Mutation روی همان مسیر اجرا شده و Verify آن
+    # True بوده باشد.
+    #
+    # known وضعیت ثبت‌شده در چرخه‌های Approval قبلی را حمل
+    # می‌کند. بدون آن، هر بار که یک Plan تأیید و اجرا می‌شود
+    # transcript از نو ساخته می‌شود و تغییرات موفقِ قبلی از
+    # دید گزارش پاک می‌شوند و به‌اشتباه «بدون تغییر»
+    # گزارش می‌شدند.
+    if not request_asks_for_mutation(user_request):
+        return []
+
+    status = {}
+
+    for item in find_requested_files(project_root, user_request):
+        path = normalize_relative_target(
+            item.get("relative_path")
+        )
+
+        if path:
+            status[path] = "not changed"
+
+    for path, state in (known or {}).items():
+
+        if path in status and state != "not changed":
+            status[path] = state
+
+    for entry in transcript or []:
+        if not entry.get("mutating"):
+            continue
+
+        verified = entry.get("verified")
+        result = entry.get("result") or {}
+
+        if verified is True:
+            state = "verified"
+        elif verified is False or result.get("ok") is False:
+            state = "failed"
+        else:
+            state = "not changed"
+
+        for path in mutation_targets_of_entry(entry):
+            if path in status and state != "not changed":
+                status[path] = state
+
+    return [
+        {"path": path, "status": state}
+        for path, state in sorted(status.items())
+    ]
+
+
+def pending_mutation_targets(
+    project_root, user_request, transcript, known=None
+):
+    # فایل‌های درخواستی که هنوز Mutation + Verify موفق
+    # ندارند. خالی یعنی کارِ خواسته‌شده کامل شده است.
+    return [
+        item["path"]
+        for item in requested_mutation_status(
+            project_root, user_request, transcript, known
+        )
+        if item.get("status") != "verified"
+    ]
+
+
+def request_status_map(
+    project_root, user_request, transcript, known=None
+):
+    # همان وضعیت واقعی، به شکل dict قابل ذخیره در Plan تا در
+    # چرخهٔ بعدیِ Approval گم نشود.
+    return {
+        item["path"]: item.get("status")
+        for item in requested_mutation_status(
+            project_root, user_request, transcript, known
+        )
+    }
+
+
 def result_was_unsuccessful(result):
     # آیا نتیجهٔ یک ابزارِ غیرmutating «بی‌نتیجه» بوده؟
     # (خطا، متن خالی، یا جستجویی با hits صفر)
@@ -10113,7 +10248,9 @@ def build_loop_report(
     final_answer=None,
     pending_plan=None,
     notes=None,
-    plan_needs_approval=True
+    plan_needs_approval=True,
+    user_request=None,
+    known_request_status=None
 ):
     # Report یکنواخت حلقه Agentic.
     lines = [
@@ -10193,6 +10330,55 @@ def build_loop_report(
         lines.append(
             clip_text(final_answer, MAX_FINAL_ANSWER_CHARS)
         )
+
+    # وضعیت واقعی فایل‌های درخواستی.
+    #
+    # «پاسخ نهایی» متن آزاد مدل است و ممکن است ادعایی فراتر
+    # از عملیات واقعاً اجراشده داشته باشد. این بلوک تنها
+    # بر پایهٔ transcript ساخته می‌شود و بلافاصله بعد از آن
+    # می‌آید تا ادعای نادرست «همه تغییرات انجام شد» با
+    # وضعیت واقعیِ فایل‌ها خنثی شود.
+    request_status = requested_mutation_status(
+        project_root, user_request, transcript, known_request_status
+    )
+
+    if request_status:
+        pending_targets = [
+            item["path"]
+            for item in request_status
+            if item.get("status") != "verified"
+        ]
+
+        lines.append("")
+        lines.append("وضعیت واقعی فایل‌های درخواستی:")
+
+        status_labels = {
+            "verified": "تغییر اعمال و Verify موفق",
+            "failed": "تغییر اعمال نشد (شکست خورد)",
+            "not changed": "بدون تغییر",
+        }
+
+        for item in request_status:
+            lines.append(
+                "- "
+                + str(item.get("path"))
+                + ": "
+                + status_labels.get(
+                    item.get("status"), item.get("status")
+                )
+            )
+
+        if pending_targets:
+            lines.append("")
+            lines.append(
+                "هشدار: درخواست کامل انجام نشد. فایل‌های نام‌برده "
+                "که تغییر و Verify نشدند: "
+                + "، ".join(pending_targets)
+            )
+            lines.append(
+                "عبارت «پاسخ نهایی» بالا فقط متن مدل است؛ مبنای "
+                "این گزارش، عملیات واقعاً اجراشده است."
+            )
 
     if pending_plan:
         lines.append("")
@@ -10893,16 +11079,26 @@ def run_loop_steps(
     correction_attempts,
     max_steps=MAX_AGENT_STEPS,
     stop_event=None,
-    progress=None
+    progress=None,
+    known_request_status=None
 ):
     # هسته حلقه:
     # مدل یک گام را انتخاب میکند → Agent همان ابزار را
     # اجرا میکند → نتیجه بهعنوان Observation برمیگردد →
     # گام بعدی تا سقف تعیینشده.
+    #
+    # known_request_status: وضعیت واقعی فایل‌های درخواستی که
+    # در چرخه‌های Approval قبلی ثبت شده و اینجا به حلقه باز
+    # گشته است. بدون آن، هر Resume یک transcript تازه می‌سازد
+    # و تغییرات موفقِ قبلی از گزارش ناپدید می‌شوند.
     system_prompt = build_loop_system_prompt()
     rejections = []
     duplicate_blocks = 0
     evidence_nudges = 0
+    # شمارندهٔ «کار خواسته‌شده هنوز کامل نیست». مثل
+    # evidence_nudges سقف کوتاه دارد تا حلقه هرگز در
+    # چرخهٔ بی‌پایان گیر نکند.
+    completion_nudges = 0
     # شمارنده‌ی خطای «نام ابزار نامعتبر». این خطا گام مصرف
     # نمی‌کند، پس برای جلوگیری از چرخش بی‌نهایت سقف جداگانه
     # و کوچک دارد.
@@ -10991,7 +11187,8 @@ def run_loop_steps(
                 project_name,
                 project_root,
                 transcript,
-                notes=["مدل پاسخ نداد: " + str(e)]
+                notes=["مدل پاسخ نداد: " + str(e)],
+                user_request=user_request
             )
 
         decision = parse_agent_decision(model_output) or {}
@@ -11037,11 +11234,43 @@ def run_loop_steps(
                     )
                     continue
 
+            # دروازهٔ تکمیل کار: برای یک درخواست تغییردهنده،
+            # «کافی بودن شواهد» معیار پایان نیست؛ معیار، اعمال
+            # و Verify شدنِ همهٔ فایل‌های نام‌برده در درخواست
+            # است. بدون این قاعده حلقه بعد از اولین Mutation
+            # موفق با یک read_file به FINAL می‌رفت و گزارش،
+            # انجام‌شدنِ کل کار را ادعا می‌کرد.
+            if (
+                not last_step
+                and is_write_allowed(allow_write)
+                and completion_nudges < MAX_COMPLETION_NUDGES
+                and steps_used < max_steps
+            ):
+                remaining = pending_mutation_targets(
+                    project_root, user_request, transcript,
+                    known_request_status
+                )
+
+                if remaining:
+                    completion_nudges += 1
+                    observations.append(
+                        "کار درخواست هنوز کامل نیست: فایل‌های "
+                        + "، ".join(remaining)
+                        + " در درخواست تغییر و Verify نشده‌اند. "
+                        "قبل از FINAL، تغییر خواسته‌شده را روی "
+                        "همین فایل‌ها اعمال کن (از همان مسیر "
+                        "تأیید و اعتبارسنجی عبور می‌کند) و "
+                        "نتیجه را Verify کن."
+                    )
+                    continue
+
             return build_loop_report(
                 project_name,
                 project_root,
                 transcript,
-                final_answer=decision.get("final") or ""
+                final_answer=decision.get("final") or "",
+                user_request=user_request,
+                known_request_status=known_request_status
             )
 
         spec = TOOL_REGISTRY.get(tool_name)
@@ -11248,6 +11477,16 @@ def run_loop_steps(
                     # حفظ می‌شود تا «حداکثر یک گام اصلاحی»
                     # در کل چرخه معتبر بماند.
                     "correction_attempts": correction_attempts,
+                    # وضعیت واقعی فایل‌های درخواستی تا این لحظه.
+                    # چون هر Resume یک transcript تازه می‌سازد،
+                    # بدون این کلید تغییرات موفقِ قبلی در گزارش
+                    # نهایی گم می‌شدند.
+                    "request_status": request_status_map(
+                        project_root,
+                        user_request,
+                        transcript,
+                        known_request_status
+                    ),
                     # Phase B: مشخصات Plan برای Re-validation
                     # قبل از Execute (additive؛ نسخه قدیمی این
                     # کلید را ندارد و Re-validation امن رد
@@ -11502,7 +11741,9 @@ def run_loop_steps(
             + str(max_steps)
             + ") پر شد؛ پاسخ نهایی از شواهد جمع‌آوری‌شده "
             "ساخته شد."
-        ]
+        ],
+        user_request=user_request,
+        known_request_status=known_request_status
     )
 
 
@@ -11647,7 +11888,12 @@ def execute_pending_action(stop_event=None):
             pending.get("correction_attempts") or 0
         ),
         max_steps=max(1, MAX_AGENT_STEPS - 1),
-        stop_event=stop_event
+        stop_event=stop_event,
+        known_request_status=(
+            pending.get("request_status")
+            if isinstance(pending.get("request_status"), dict)
+            else None
+        )
     )
 
 
