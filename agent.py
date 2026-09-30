@@ -6435,6 +6435,7 @@ APPROVAL_KEYWORDS = (
     "تایید",
     "تأیید",
     "بله",
+    "اوکی",
     "موافقم",
     "ادامه بده",
     "اجرا کن",
@@ -6451,6 +6452,7 @@ CANCEL_KEYWORDS = (
     "انصراف",
     "نخیر",
     "نه",
+    "بیخیال",
     "cancel",
     "abort",
 )
@@ -6680,9 +6682,32 @@ def get_recent_conversation_text(
     return "\n".join(lines)
 
 
+def normalize_control_reply_text(text):
+    # نرمال‌سازی محدود و مشترک پاسخ Approval (تأیید/لغو).
+    # فقط شکل نوشتاری را یکسان می‌کند: الف/همزه عربی
+    # (أإآ→ا)، یای عربی با همزه (ئ→ی) و ة→ه.
+    # هیچ کلمه‌ای اضافه یا حذف نمی‌شود و تطبیق همچنان
+    # دقیقاً روی متن کامل انجام می‌گیرد، پس این تابع فقط
+    # «شکل» ورودی کاربر را تفسیر می‌کند و Gate را تغییر
+    # نمی‌دهد. (کنترل‌های Emergency Stop اصلاً از این مسیر
+    # نمی‌آیند.)
+    text = normalize_request_text(text)
+
+    for source, target in (
+        ("\u0623", "\u0627"),
+        ("\u0625", "\u0627"),
+        ("\u0622", "\u0627"),
+        ("\u0626", "\u06cc"),
+        ("\u0629", "\u0647"),
+    ):
+        text = text.replace(source, target)
+
+    return text
+
+
 def detect_control_reply(user_request):
     # تشخیص پاسخ کوتاه تأیید/لغو برای Gate تأیید.
-    text = normalize_request_text(user_request)
+    text = normalize_control_reply_text(user_request)
     text = text.strip().strip("!.؟?,;:")
 
     if not text or len(text) > 30:
@@ -9296,6 +9321,46 @@ def is_correction_of_last_failure(tool_name, args, transcript):
     )
 
 
+def is_failed_mutation_before_apply(entry):
+    # شکست Mutation پیش از اعمال تغییر روی دیسک؛ مثلاً
+    # edit_file با متن old اشتباه یا فایل ناموجود.
+    # در این حالت هیچ تغییری انجام نشده و Verify اصلاً
+    # اجرا نشده است، پس verified برابر None می‌ماند و
+    # مسیر «اصلاح پس از Verify ناموفق» آن را نمی‌بیند.
+    if not entry or not entry.get("mutating"):
+        return False
+
+    result = entry.get("result") or {}
+
+    return (
+        result.get("ok") is False
+        and result.get("verified") is None
+    )
+
+
+def is_correction_of_failed_mutation(tool_name, args, transcript):
+    # یعنی «تلاش اصلاحی» پس از شکست پیش از اعمال تغییر.
+    # برخلاف is_correction_of_last_failure، این تشخیص فقط
+    # یک برچسب است: خودِ اجرا از مسیر عادی Plan →
+    # Approval → Re-validation → Execute عبور می‌کند و
+    # هیچ فایلی را مستقیم تغییر نمی‌دهد.
+    last = last_mutating_entry(transcript)
+
+    if last is None:
+        return False
+
+    if not is_failed_mutation_before_apply(last):
+        return False
+
+    if last.get("tool") != tool_name:
+        return False
+
+    return (
+        primary_target(tool_name, args)
+        == primary_target(last.get("tool"), last.get("args") or {})
+    )
+
+
 def result_was_unsuccessful(result):
     # آیا نتیجهٔ یک ابزارِ غیرmutating «بی‌نتیجه» بوده؟
     # (خطا، متن خالی، یا جستجویی با hits صفر)
@@ -9741,6 +9806,32 @@ def build_loop_user_prompt(
                 "NOTE: the last change FAILED verification and "
                 "the correction limit is used. Do not propose "
                 "another change; answer with FINAL."
+            )
+
+        parts.append("")
+
+    elif last is not None and is_failed_mutation_before_apply(last):
+        # شکست Mutation پیش از اعمال تغییر (مثلاً متن old
+        # اشتباه در edit_file): هیچ تغییری روی دیسک انجام
+        # نشده است. خطای واقعی در Observation بالا آمده؛
+        # اینجا فقط مسیر مجاز بعدی صریح می‌شود: اول فایل
+        # فعلی را بخوان، بعد یک گام اصلاحی پیشنهاد بده که
+        # دوباره از Approval و Re-validation عبور می‌کند.
+        if correction_attempts < MAX_CORRECTION_STEPS:
+            parts.append(
+                "MUTATION FAILED (nothing was changed on disk)."
+            )
+            parts.append(
+                "NOTE: read the current file first, then propose "
+                "ONE corrected step with the same tool and the same "
+                "path (it goes through approval and validation "
+                "again), or explain what is missing."
+            )
+        else:
+            parts.append(
+                "NOTE: the mutation FAILED and the correction limit "
+                "is used. Do not propose another change; answer with "
+                "FINAL."
             )
 
         parts.append("")
@@ -10837,6 +10928,31 @@ def run_loop_steps(
 
         steps_used += 1
 
+        # سقف گام اصلاحی تمام شده و آخرین Mutation پیش از
+        # اعمال تغییر شکست خورده است: همان‌جا متوقف می‌شویم.
+        # این بررسی هر دو حالت را می‌گیرد — هم Mutation داخل
+        # حلقه و هم Mutation تأییدشده‌ای که در
+        # execute_pending_action اجرا و اینجا به حلقه بازگشته
+        # است — و پیش از هر مدل/ابزار/Mutation جدید اجرا
+        # می‌شود.
+        if (
+            correction_attempts >= MAX_CORRECTION_STEPS
+            and is_failed_mutation_before_apply(
+                last_mutating_entry(transcript)
+            )
+        ):
+            return build_loop_report(
+                project_name,
+                project_root,
+                transcript,
+                notes=[
+                    "Mutation پیش از اعمال تغییر روی دیسک شکست "
+                    "خورد و سقف گام اصلاحی ("
+                    + str(MAX_CORRECTION_STEPS)
+                    + ") پر شده است؛ اجرا متوقف شد."
+                ]
+            )
+
         emit_progress(
             progress,
             "step_start",
@@ -11065,6 +11181,26 @@ def run_loop_steps(
                 )
             )
 
+            # شکست Mutation پیش از اعمال تغییر، سقف اصلاح را
+            # مصرف می‌کند اما اجرا را از مسیر عادی رد می‌کند:
+            # Plan، Approval، Safety و Re-validation عیناً مثل
+            # هر Mutation دیگر اجرا می‌شوند.
+            failed_mutation_correction = (
+                not auto_correction
+                and correction_attempts < MAX_CORRECTION_STEPS
+                and is_correction_of_failed_mutation(
+                    tool_name, args, transcript
+                )
+            )
+
+            if failed_mutation_correction:
+                correction_attempts += 1
+                observations.append(
+                    "گام اصلاحی پس از شکست Mutation: همان ابزار و "
+                    "همان مسیر قبلی؛ این بار از همان مسیر تأیید، "
+                    "اعتبارسنجی و Verify عبور می‌کند."
+                )
+
             if not auto_correction:
                 plan_text = build_pending_plan_text(
                     tool_name, args, project_root,
@@ -11108,6 +11244,10 @@ def run_loop_steps(
                     "project": project_name,
                     "project_root": project_root,
                     "user_request": user_request,
+                    # سقف گام اصلاحی تا Resume بعد از Approval
+                    # حفظ می‌شود تا «حداکثر یک گام اصلاحی»
+                    # در کل چرخه معتبر بماند.
+                    "correction_attempts": correction_attempts,
                     # Phase B: مشخصات Plan برای Re-validation
                     # قبل از Execute (additive؛ نسخه قدیمی این
                     # کلید را ندارد و Re-validation امن رد
@@ -11503,7 +11643,9 @@ def execute_pending_action(stop_event=None):
         transcript=[entry],
         observations=[observation],
         steps_used=1,
-        correction_attempts=0,
+        correction_attempts=int(
+            pending.get("correction_attempts") or 0
+        ),
         max_steps=max(1, MAX_AGENT_STEPS - 1),
         stop_event=stop_event
     )
@@ -11544,6 +11686,16 @@ def should_use_agentic_loop(user_request, project_root):
         path_count = 0
 
     if action_count >= 1 and read_count >= 1 and path_count >= 1:
+        return True
+
+    # فعل تغییردهنده + مسیر صریح، حتی بدون فعل «خواندن»، یک
+    # درخواست عملیاتی چندمرحله‌ای است: مدل باید اول فایل را
+    # ببیند، Plan بدهد و از Approval/Re-validation عبور کند.
+    # پیش از این قاعده، درخواستی مثل «فقط رنگ متن .text را
+    # در style.css تغییر بده» به‌اشتباه به مسیر متنی Legacy
+    # می‌رفت. درخواست عملیاتیِ بدون مسیر (مثلاً «این تابع را
+    # بنویس») دست‌نخورده می‌ماند و همچنان متنی است.
+    if action_count >= 1 and path_count >= 1:
         return True
 
     if action_count == 0 and read_count >= 2 and path_count >= 2:

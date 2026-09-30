@@ -1634,7 +1634,7 @@ button:hover {
 
 <script>
 const form = document.getElementById("agentForm");
-const button = document.getElementById("anglesButton");
+const button = document.getElementById("submitButton");
 const stopButton = document.getElementById("stopButton");
 
 form.addEventListener("submit", function() {
@@ -2275,6 +2275,12 @@ def index():
                 agent_thread.start()
 
                 running = True
+
+                # درخواست پیش‌تر به thread و تاریخچه تحویل
+                # شده است؛ مقدار باقیمانده فقط برای رندر
+                # دوباره است، پس کادر ورودی برای درخواست بعدی
+                # خالی می‌ماند. (Enter و رفتار فرم تغییری نمی‌کند.)
+                request_text = ""
 
                 # Diff/Plan/Validation در GET بعدی خوانده
                 # می‌شوند، نه در همین پاسخ.
