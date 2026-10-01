@@ -10024,7 +10024,8 @@ def build_pending_plan_text(
     tool_name,
     args,
     project_root,
-    write_mode=True
+    write_mode=True,
+    plan_summary=None
 ):
     # Plan قابل نمایش به کاربر قبل از عملیات تغییردهنده.
     lines = ["ابزار: " + tool_name]
@@ -10096,6 +10097,15 @@ def build_pending_plan_text(
             "دستور داخل Project Scope و بدون Shell اجرا میشود."
         )
 
+    # Stage 4 — خلاصهٔ چندفایلی grounded، اگر وجود داشته باشد،
+    # دقیقاً قبل از پیام Approval نمایش داده می‌شود تا ترتیب
+    # «Plan → Summary → Approval» برای کاربر واقعی باشد.
+    # این متن فقط نمایشی است و هیچ اثری روی Plan، Approval،
+    # Re-validation یا مسیر اجرا ندارد.
+    if plan_summary:
+        lines.append("")
+        lines.append(str(plan_summary))
+
     lines.append("")
 
     # شرط سخت‌گیرانه: فقط وقتی واقعاً مجاز است که Gate هم
@@ -10111,6 +10121,120 @@ def build_pending_plan_text(
         lines.append(
             "برای اجرا، همین درخواست را با حالت Write تکرار کنید."
         )
+
+    return "\n".join(lines)
+
+
+PLAN_SUMMARY_CONTENT_PREVIEW_CHARS = 80
+
+
+def build_multi_file_plan_summary(pending):
+    # Stage 4 — خلاصهٔ چندفایلی grounded.
+    #
+    # این خلاصه فقط و فقط از همان Plan canonical موجود (همان
+    # Pending Action) ساخته می‌شود: همان tool، همان args و همان
+    # context معتبر Re-validation. هیچ مسیر، نوع عملیات یا متنی
+    # حدس زده نمی‌شود و متن خام درخواست کاربر هیچ نقشی ندارد؛ اگر
+    # Plan و Context با هم هم‌خوان نباشند، اصلاً خلاصه‌ای ساخته
+    # نمی‌شود (Fail Closed) و رفتار قبلی دست‌نخورده می‌ماند.
+    #
+    # تابع کاملاً Read-only است: نه Plan را mutate می‌کند، نه فایلی
+    # می‌نویسد، نه Approval/Re-validation/Safety را دور می‌زند و نه
+    # مسیر Mutation جدیدی می‌سازد. درخواست تک‌فایلی هم اصلاً خلاصهٔ
+    # چندفایلی نمی‌گیرد تا رفتار فعلی آن کاملاً حفظ شود.
+    if not isinstance(pending, dict):
+        return None
+
+    if pending.get("tool") != "write_files":
+        return None
+
+    args = pending.get("args")
+    context = pending.get("context")
+
+    if not isinstance(args, dict) or not isinstance(context, dict):
+        return None
+
+    try:
+        files = normalize_batch_files(args)
+    except Exception:
+        return None
+
+    if len(files) < 2:
+        return None
+
+    recorded_paths = context.get("batch_paths")
+
+    if not isinstance(recorded_paths, list):
+        return None
+
+    if [str(item) for item in recorded_paths] != [
+        str(item.get("path")) for item in files
+    ]:
+        # اعضای Plan با رکورد Re-validation یکی نیستند؛ به‌جای
+        # نمایش چیزی نامطمئن، هیچ خلاصه‌ای ساخته نمی‌شود.
+        return None
+
+    project_root = pending.get("project_root")
+
+    if not project_root:
+        return None
+
+    lines = [
+        "خلاصه Plan چندفایلی ("
+        + str(len(files))
+        + " فایل، همه با یک تأیید):"
+    ]
+
+    for item in files:
+        path = str(item.get("path"))
+        content = str(item.get("content") or "")
+
+        try:
+            exists = os.path.exists(
+                resolve_project_path(project_root, path)
+            )
+
+        except Exception:
+            exists = None
+
+        if exists is None:
+            operation = "عملیات: نامشخص (مسیر معتبر نیست)"
+
+        elif exists:
+            operation = "عملیات: بازنویسی فایل موجود"
+
+        else:
+            operation = "عملیات: ایجاد فایل جدید"
+
+        preview = ""
+
+        for raw_line in content.splitlines():
+            candidate = raw_line.strip()
+
+            if candidate:
+                preview = candidate
+                break
+
+        if len(preview) > PLAN_SUMMARY_CONTENT_PREVIEW_CHARS:
+            preview = (
+                preview[:PLAN_SUMMARY_CONTENT_PREVIEW_CHARS] + "..."
+            )
+
+        lines.append(
+            "- "
+            + path
+            + " | "
+            + operation
+            + " | "
+            + str(len(content))
+            + " کاراکتر"
+            + (" | " + preview if preview else "")
+        )
+
+    lines.append(
+        "این خلاصه فقط از روی همین Plan واقعی ساخته شده است؛ "
+        "محتوای کامل فایل‌ها اینجا نمایش داده نمی‌شود."
+    )
 
     return "\n".join(lines)
 
@@ -12603,11 +12727,25 @@ def run_loop_steps(
                     tool=tool_name
                 )
 
+                # Stage 4 — خلاصهٔ چندفایلی دقیقاً بعد از ساخت Plan
+                # canonical و بعد از آماده شدن Context معتبر
+                # Re-validation و قبل از نمایش Approval ساخته
+                # می‌شود. متن همان Plan است؛ Approval همان
+                # pending_action را مصرف می‌کند و خلاصه هیچ
+                # مسیر اجرایی یا Mutation جدیدی نمی‌سازد.
+                display_plan_text = build_pending_plan_text(
+                    tool_name, args, project_root,
+                    write_mode=allow_write,
+                    plan_summary=build_multi_file_plan_summary(
+                        pending_action
+                    ),
+                )
+
                 return build_loop_report(
                     project_name,
                     project_root,
                     transcript,
-                    pending_plan=plan_text,
+                    pending_plan=display_plan_text,
                     notes=[
                         "هیچ تغییری هنوز روی دیسک انجام نشده "
                         "است. پس از تأیید، همین عملیات اجرا و "
@@ -13234,6 +13372,17 @@ def handle_agent_batch_proposal(
         # A correction is never a shortcut: it enters this same gate.
         if not is_autonomous_project(project_name):
             remember_pending_action(pending_action)
+
+            # Stage 4 — همان Plan canonical، همان Context معتبر
+            # Re-validation، همان Approval. خلاصه فقط نمایشی است
+            # و قبل از پیام Approval نمایش داده می‌شود.
+            plan_text = build_pending_plan_text(
+                tool_name, proposal_args, project_root,
+                write_mode=allow_write,
+                plan_summary=build_multi_file_plan_summary(
+                    pending_action
+                ),
+            )
 
             return build_loop_report(
                 project_name,
