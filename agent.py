@@ -3769,6 +3769,91 @@ ALLOWED_COMMAND_TOOLS = (
     "tsc", "eslint", "stylelint", "git",
 )
 
+# Phase 1 — Command Policy.
+#
+# ALLOWED_COMMAND_TOOLS فقط argv[0] را بررسی می‌کند؛ پس
+# «git» یا «npm» بودنِ ابزار به‌تنهایی مجوز کافی نیست.
+# این جدول زیر‌دسته‌هایی را مسدود می‌کند که یا فایل‌های
+# پروژه را غیرقابل‌بازگشت تغییر می‌دهند یا کد دلخواه
+# دانلود و اجرا می‌کنند.
+#
+# این مقصد Undo ندارند: run_command در
+# UNDOABLE_TOOLS نیست و before_state آن undoable=False
+# است. پس مجاز شدنشان یعنی تغییر غیرقابل‌بازگشت، بدون
+# Ask و بدون Rollback.
+#
+# قاعده Fail Closed: هر زیر‌دسته‌ای که در این جدول نباشد
+# مجاز است، اما زیر‌دسته‌های فهرست‌شده همیشه رد می‌شوند.
+# ابزارهای خارج از ALLOWED_COMMAND_TOOLS همچنان رد می‌شوند.
+COMMAND_POLICY_BLOCKED_SUBCOMMANDS = {
+    # تغییر/پاک‌کردن تاریخچه و فایل‌های tracked:
+    # نه Backup ساخته می‌شود، نه Undo وجود دارد.
+    "git": frozenset({
+        "checkout", "restore", "reset", "clean", "rm", "mv",
+        "push", "pull", "rebase", "merge", "filter-branch",
+        "gc", "prune", "reflog", "stash",
+    }),
+    # نصب/حذف Package: دانلود از شبکه + اجرای
+    # post-install script و دست‌کم تغییر lockfile.
+    "pip": frozenset({
+        "install", "uninstall", "download", "wheel",
+    }),
+    "pip3": frozenset({
+        "install", "uninstall", "download", "wheel",
+    }),
+    "npm": frozenset({
+        "install", "i", "ci", "uninstall", "rm", "update",
+        "publish", "exec", "init", "audit", "link", "dedupe",
+    }),
+    "yarn": frozenset({
+        "install", "add", "remove", "upgrade", "publish", "exec",
+    }),
+    "pnpm": frozenset({
+        "install", "i", "add", "remove", "update", "publish", "exec",
+    }),
+    # npx هر Package نصب‌نشده‌ای را اجرا می‌کند؛
+    # عملاً اجرای کد دلخواه از شبکه است.
+    "npx": frozenset({"__all__"}),
+    "composer": frozenset({
+        "require", "install", "update", "remove", "create-project",
+    }),
+}
+
+
+def command_policy_denied_subcommand(tool, argv):
+    # Phase 1 — Command Policy: Fail Closed.
+    # اولین توکنِ بدون «-» بعد از argv[0] زیر‌دسته واقعی
+    # است تا flagهای سراسری (مثل git --no-pager) آن را
+    # جابه‌جا نکنند. خروجی: None یا دلیل مسدودبودن.
+    blocked = COMMAND_POLICY_BLOCKED_SUBCOMMANDS.get(tool)
+
+    if not blocked:
+        return None
+
+    subcommand = None
+
+    for token in list(argv)[1:]:
+        text = str(token)
+
+        if not text.startswith("-"):
+            subcommand = text.lower()
+            break
+
+    if subcommand is None:
+        # ابزار بدون زیر‌دسته اجرا نمی‌شود مگر آنکه
+        # صریحاً مجاز اعلام شده باشد (مثل pip install که
+        # همیشه زیر‌دسته دارد و در فهرست مسدود است).
+        return None
+
+    if "__all__" in blocked or subcommand in blocked:
+        return (
+            "زیر‌دستهٔ «" + subcommand + "» برای «" + tool + "» "
+            "طبق Command Policy مسدود است: این عملیات "
+            "غیرقابل‌بازگشت است و Undo ندارد."
+        )
+
+    return None
+
 
 def is_inside_project(project_root, full_path):
     # کنترل نهایی و مستقل از safe_path: مسیر واقعی
@@ -4949,7 +5034,17 @@ def run_command(
             + "\nابزارهای مجاز: "
             + ", ".join(allowed_tools)
         )
+        return result
 
+    # Phase 1 — Command Policy: argv[0] به‌تنهایی کافی نیست.
+    # زیر‌دسته‌های غیرقابل‌بازگشت (نصب Package یا
+    # تغییر/پاک‌کردن tracked files) پیش از هر subprocess
+    # و پیش از هر تغییری روی دیسک رد می‌شوند.
+    policy_denial = command_policy_denied_subcommand(tool, argv)
+
+    if policy_denial:
+        result["allowed"] = False
+        result["error"] = policy_denial
         return result
 
     started = time.time()
@@ -13854,6 +13949,15 @@ def run_agent(
     #    تستشده) بدون هیچ تغییری.
     project_root = get_project_path(project_name)
 
+    # Phase 1 — Legacy Fallback Fail-Closed.
+    #
+    # در ابتدای تابع مقداردهی می‌شود، نه فقط پیش از
+    # شاخهٔ حلقه: هر استثنای پیش از رسیدن به آن نقطه
+    # (مثلاً مسیر General Mode) در غیر این صورت به
+    # UnboundLocalError می‌رسید و به‌جای Fail-Closed یک
+    # خطای داخلی گزارش می‌شد.
+    canonical_path_failed = False
+
     remember_conversation_message(
         "user", user_request, project_name
     )
@@ -14082,6 +14186,13 @@ def run_agent(
             # تنها راه رسیدن به Legacy در Apply، fallbackِ
             # «مدل در دسترس نیست» است؛ آن مسیر هم Fail-Closed
             # است و هیچ Write مستقیمی ندارد.
+            #
+            # Phase 1: این ادعا فقط وقتی درست می‌ماند که
+            # Legacy در آن شرایط واقعاً Write نکند. به همین
+            # دلیل canonical_path_failed (که در ابتدای
+            # همین تابع صفر شده) تعیین می‌شود و پایین‌تر به
+            # یک پاسخ Fail-Closed تبدیل می‌گردد، نه به اجازهٔ
+            # عبور به intent handlerهای تغییردهنده.
             use_agentic_loop = should_use_agentic_loop(
                 user_request, project_root
             )
@@ -14106,6 +14217,10 @@ def run_agent(
 
                     return loop_result
 
+                # Phase 1: canonical path unavailable (model down).
+                # درخواستِ تغییردهنده نباید به Legacy برسد.
+                canonical_path_failed = True
+
         except Exception:
             # Agentic Loop هرگز نباید مسیرهای تستشده را
             # خراب کند؛ در صورت خطای غیرمنتظره، اجرای
@@ -14122,6 +14237,51 @@ def run_agent(
                 project_name,
                 sys.exc_info(),
             )
+
+            # Phase 1: خطای غیرمنتظرهٔ حلقه هم یعنی مسیر
+            # Canonical در دسترس نیست؛ نباید به Legacyِ
+            # تغییردهنده سپرده شود.
+            canonical_path_failed = True
+
+    # Phase 1 — Legacy Fallback Fail-Closed.
+    #
+    # قبلاً اگر حلقهٔ Canonical به هر دلیلی برنمی‌گشت
+    # (مدل در دسترس نبود یا استثنا داد)، اجرا به
+    # run_agent_legacy می‌رسید و intent handlerهای
+    # handle_command/delete/move/create/edit مستقیماً
+    # run_command / delete_entry / move_entry / write_file /
+    # edit_file را صدا می‌زدند — بدون Approval، بدون
+    # Re-validation و بدون Plan. یعنی خرابی مدل،
+    # سطح ایمنی را پایین می‌آورد.
+    #
+    # در حالت Apply اکنون Fail-Closed است: نه mutation،
+    # نه false success، فقط پیام روشن. حالت Review
+    # (allow_write نیست) طبق رفتار قبلیِ خواندنی سالم
+    # می‌ماند و از Legacy عبور می‌کند.
+    if is_write_allowed(allow_write) and canonical_path_failed:
+        result = build_report(
+            "Apply",
+            project_name,
+            project_root,
+            [
+                "مسیر اصلی Agent (Plan → Re-validation → "
+                "Approval → Execute → Verify → Journal) "
+                "در دسترس نبود، بنابراین هیچ تغییری انجام "
+                "نشد.",
+                "این تصمیم عمداً Fail-Closed است: بدون "
+                "Plan و Approval هیچ Write، Move، Delete یا "
+                "Command اجرا نمی‌شود.",
+                "لطفاً سرویس مدل محلی را بررسی کنید "
+                "(http://127.0.0.1:8080) و درخواست را "
+                "دوباره بفرستید.",
+            ],
+        )
+
+        remember_conversation_message(
+            "agent", result, project_name
+        )
+
+        return result
 
     try:
         result = run_agent_legacy(

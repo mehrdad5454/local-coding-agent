@@ -18,10 +18,16 @@ from agent import (
     load_projects,
     add_project,
     remove_project,
-    write_file_multi,
+    validate_mutating_args,
+    build_pending_revalidation_context,
+    build_pending_plan_text,
+    build_multi_file_plan_summary,
+    remember_pending_action,
+    execute_pending_action,
     get_last_write_multi_result,
     get_pending_action,
     handle_pending_action_request,
+    is_stop_requested,
 )
 import os
 import time
@@ -32,6 +38,39 @@ from tkinter import filedialog
 import threading
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------
+# Phase 1 — Localhost Origin Policy
+# ---------------------------------------------------------
+# سرور فقط روی 127.0.0.1 گوش می‌دهد (app.run در انتهای
+# فایل) و هیچ سامانهٔ احراز هویتی ندارد. بنابراین تنها
+# محافظ مؤثر در برابر یک صفحهٔ وبِ دلخواه، محدودکردن
+# Origin است.
+#
+# قاعده: فقط Origin خالی (درخواست هم‌مبدأ/مستقیم) یا
+# localhost پذیرفته می‌شود. هر Origin دیگری — و
+# به‌خصوص Origin خالی‌نبودنِ غیرمحلی — رد می‌شود.
+LOCAL_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def is_local_origin(origin):
+    origin = str(origin or "").strip()
+
+    if not origin:
+        # درخواست بدون Origin: فرم یا ابزار محلی.
+        return True
+
+    # فقط http/https؛ origin دیگری (مثل file://) رد می‌شود.
+    match = re.match(
+        r"^(https?)://([^/:]+|\[[^\]]+\])(?::\d+)?$",
+        origin,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return False
+
+    return match.group(2).lower() in LOCAL_ORIGIN_HOSTS
 
 # نگهداری event مربوط به اجرای فعال Agent
 # برای امکان توقف اجرای در حال انجام از رابط وب
@@ -394,8 +433,22 @@ def run_agent_background(
 
 @app.before_request
 def handle_cors_preflight():
+    # Phase 1 — Web Security.
+    #
+    # Preflight فقط از Originهای localhost پذیرفته می‌شود.
+    # پیش از این تغییر هر Originی با Access-Control-Allow-Origin: *
+    # می‌توانست state-changing routeها را cross-site صدا بزند.
+    origin = request.headers.get("Origin", "")
     if request.method == "OPTIONS":
+        if not is_local_origin(origin):
+            resp = app.make_response(("", 403))
+            return resp
         resp = app.make_response(("", 204))
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, OPTIONS"
+        )
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp
 
 
@@ -499,9 +552,29 @@ def has_pending_approval():
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    # Phase 1 — Web Security.
+    #
+    # پیش از این تغییر این هدر روی همهٔ پاسخ‌ها با مقدار
+    # «*» می‌رفت؛ یعنی هر صفحهٔ وبِ باز می‌توانست
+    # POST /multi-write را cross-site بفرستد و داخل
+    # پروژه‌های ثبت‌شده فایل بنویسد.
+    #
+    # حالا هدر فقط وقتی ارسال می‌شود که Origin واقعاً
+    # localhost باشد. درخواست‌های بدون Origin (همان
+    # حالت معمولِ مرورگر برای فرم‌های هم‌مبدأ) بدون
+    # این هدر برگشت می‌آیند و رفتار عادی Localhost-first
+    # حفظ می‌شود.
+    origin = request.headers.get("Origin", "")
+
+    if is_local_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, OPTIONS"
+        )
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type"
+        )
+
     return response
 
 
@@ -1369,20 +1442,32 @@ button:hover {
 {% endfor %}
 </select>
 
-<button
-    type="button"
-    class="small-button"
-    onclick="window.location.href='/add-project'">
-    + افزودن پروژه
-</button>
+<form
+    method="post"
+    action="/add-project"
+    style="display:inline">
+    <button
+        type="submit"
+        class="small-button">
+        + افزودن پروژه
+    </button>
+</form>
 
 {% if project_name != "agent-test" and project_name != "general" %}
-<button
-    type="button"
-    class="small-button remove-button"
-    onclick="window.location.href='/remove-project?name={{ project_name|urlencode }}'">
-    حذف
-</button>
+<form
+    method="post"
+    action="/remove-project"
+    style="display:inline">
+    <input
+        type="hidden"
+        name="name"
+        value="{{ project_name | e }}">
+    <button
+        type="submit"
+        class="small-button remove-button">
+        حذف
+    </button>
+</form>
 {% endif %}
 
 </div>
@@ -1635,6 +1720,12 @@ button:hover {
             type="hidden"
             name="project"
             value="{{ project_name | e }}"
+        >
+
+        <input
+            type="hidden"
+            name="mode"
+            value="{{ mode }}"
         >
 
         <input
@@ -2337,9 +2428,12 @@ def index():
     )
 
 
-@app.route("/add-project")
+@app.route("/add-project", methods=["POST"])
 def add_project_route():
-
+    # Phase 1: این route پیش از این تغییر GET بود و
+    # projects.json را تغییر می‌داد؛ یعنی یک لینک یا
+    # prefetch ساده می‌توانست پیکربندی پروژه‌ها را عوض
+    # کند. حالا فقط POST معتبر است.
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -2376,10 +2470,12 @@ def add_project_route():
     return redirect(url_for("index"))
 
 
-@app.route("/remove-project")
+@app.route("/remove-project", methods=["POST"])
 def remove_project_route():
-
-    name = request.args.get(
+    # Phase 1: این route پیش از این تغییر GET بود و
+    # پروژه را از projects.json حذف می‌کرد. حذف پروژه
+    # یک عملیات state-changing است، پس فقط POST.
+    name = request.form.get(
         "name",
         ""
     ).strip()
@@ -2403,6 +2499,22 @@ def rollback_route():
         next(iter(projects))
     ).strip()
 
+    # Phase 1 — Rollback Safety Gate.
+    #
+    # پیش از این تغییر این route مقدار mode را نمی‌خواند و
+    # مستقیم rollback_file را صدا می‌زد؛ بنابراین در حالت
+    # «فقط بررسی» هم می‌شد فایلی را با Backup قدیمی
+    # بازنویسی کرد و Emergency Stop هم جلویش را نمی‌گرفت.
+    #
+    # تغییر رفتار عمدی و کمینه است: همان rollback_file با
+    # همان ثبت recovery در Journal اجرا می‌شود، فقط دو
+    # قانون پیش از آن اعمال می‌شود:
+    #   1) Rollback یک Mutation است، پس به اجازهٔ Write نیاز
+    #      دارد (همان قاعدهٔ Fail-Closed خود agent.py).
+    #   2) Emergency Stop باید مؤثر باشد.
+    mode = request.form.get("mode", "read").strip() or "read"
+    allow_write = resolve_allow_write(mode)
+
     relative_path = request.form.get(
         "file",
         ""
@@ -2410,7 +2522,6 @@ def rollback_route():
 
     result = ""
     request_text = ""
-    mode = "read"
     running = False
     diff_text = ""
     diff_state = ""
@@ -2424,6 +2535,26 @@ def rollback_route():
             "را وارد کنید."
         )
 
+    elif not allow_write:
+
+        # Fail-Closed: بدون اجازهٔ Write هیچ فایلی بازنویسی
+        # نمی‌شود. پیام صریح است تا کاربر فکر نکند Rollback
+        # انجام شده است.
+        result = (
+            "Rollback یک عملیات تغییردهنده است و در حالت "
+            "«فقط بررسی» انجام نمی‌شود؛ هیچ فایلی تغییر "
+            "نکرد.\nبرای بازگردانی، حالت «اعمال تغییر» را "
+            "انتخاب کنید."
+        )
+
+    elif is_stop_requested():
+
+        # Emergency Stop باید روی Rollback هم مؤثر باشد.
+        result = (
+            "Emergency Stop فعال است؛ Rollback اجرا نشد و "
+            "هیچ فایلی تغییر نکرد."
+        )
+
     else:
 
         try:
@@ -2432,6 +2563,9 @@ def rollback_route():
             # اجرا می‌شود؛ هیچ‌وقت خودکار نیست.
             # مسیر Backup توسط خود Agent تشخیص
             # داده می‌شود و از کاربر گرفته نمی‌شود.
+            #
+            # ثبت recovery در Journal عیناً حفظ می‌شود؛
+            # این تغییر فقط Gate ورودی است، نه منطق Rollback.
             rollback_file(
                 projects.get(project_name),
                 relative_path,
@@ -2493,6 +2627,99 @@ def rollback_route():
     )
 
 
+def build_multi_write_plan(
+    project_name,
+    project_root,
+    files
+):
+    # Phase 1 — ساخت Plan canonical برای /multi-write.
+    #
+    # این تابع عمداً هیچ فایلی نمی‌نویسد. کارش فقط ساخت
+    # همان pending_actionای است که Agentic Loop برای
+    # write_files می‌سازد:
+    #
+    #   validate_mutating_args → build_pending_revalidation_context
+    #   → remember_pending_action
+    #
+    # بنابراین درخواست بعدیِ کاربر («تأیید») از
+    # handle_pending_action_request → execute_pending_action
+    # عبور می‌کند و Re-validation، Execute، Verify و
+    # Journal همان‌طور که برای هر Write دیگر اجرا می‌شوند.
+    #
+    # به‌کارگیری context، plan summary و متادیتای Plan از
+    # خود agent.py وام گرفته می‌شود؛ هیچ منطق Plan یا
+    # Re-validation دوباره‌نویسی نشده است.
+    args = {"files": files}
+
+    try:
+        validate_mutating_args(
+            project_root,
+            "write_files",
+            args
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "error": (
+                "Args این Write معتبر نیست؛ هیچ تغییری انجام "
+                "نشد: " + str(e)
+            ),
+        }
+
+    try:
+        context = build_pending_revalidation_context(
+            "write_files",
+            args,
+            project_root,
+            project_name,
+            allow_write=True,
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "error": (
+                "ساخت Context برای Re-validation ممکن نشد؛ "
+                "هیچ تغییری انجام نشد: " + str(e)
+            ),
+        }
+
+    pending_action = {
+        "tool": "write_files",
+        "args": args,
+        "project": project_name,
+        "project_root": project_root,
+        "user_request": (
+            "Multi-file Write از رابط وب (HTTP /multi-write)"
+        ),
+        "correction_attempts": 0,
+        "request_status": {},
+        "read_paths": [],
+        "context": context,
+    }
+
+    remember_pending_action(pending_action)
+
+    return {
+        "success": True,
+        "pending_action": True,
+        "needs_approval": True,
+        "message": (
+            "Plan چندفایلی ساخته شد اما هنوز هیچ فایلی نوشته "
+            "نشده است. برای اجرای همین Plan، «تأیید» را "
+            "بفرستید."
+        ),
+        "plan": build_pending_plan_text(
+            "write_files",
+            args,
+            project_root,
+            write_mode=True,
+            plan_summary=build_multi_file_plan_summary(
+                pending_action
+            ),
+        ),
+    }
+
+
 @app.route("/multi-write", methods=["POST"])
 def multi_write_route():
     # Multi-file Write: دریافت درخواست JSON شامل
@@ -2549,19 +2776,66 @@ def multi_write_route():
             400,
         )
     else:
-        try:
-            result = write_file_multi(
-                project_root,
-                files,
-                return_details=True
+        # Phase 1 — /multi-write دیگر اجازهٔ Write ندارد.
+        #
+        # پیش از این تغییر این route مستقیم
+        # write_file_multi را صدا می‌زد و در نتیجه هیچ
+        # Approval، Re-validation یا is_write_allowed و
+        # — مهم‌تر از همه — هیچ Journal ثبت نمی‌شد؛ یعنی یک
+        # Write موفق از این مسیر هرگز Undo نمی‌شد.
+        #
+        # این route فقط Plan canonical می‌سازد (همان
+        # pending_actionای که Agentic Loop می‌سازد) و آن را
+        # برای یک Approval کاربر ذخیره می‌کند. اجرای واقعی
+        # بعد از «تأیید» و از مسیر execute_pending_action
+        # انجام می‌شود؛ یعنی Plan → Re-validation →
+        # Approval → Execute → Verify → Journal → Undo.
+        if not resolve_allow_write(
+            (request_data.get("mode") or request.args.get("mode", "read"))
+        ):
+            return (
+                jsonify({
+                    "success": False,
+                    "needs_approval": True,
+                    "error": (
+                        "Multi-file Write یک عملیات تغییردهنده "
+                        "است و فقط با اجازهٔ Write ساخته می‌شود؛ "
+                        "هیچ فایلی تغییر نکرد."
+                    ),
+                }),
+                403,
             )
-        except Exception as e:
-            result = get_last_write_multi_result()
-            if not result:
-                error_msg = (
-                    "Multi-file Write ناموفق: "
-                    + str(e)
-                )
+
+        if is_stop_requested():
+            return (
+                jsonify({
+                    "success": False,
+                    "error": (
+                        "Emergency Stop فعال است؛ هیچ Plan "
+                        "تغییردهنده‌ای ساخته نشد."
+                    ),
+                }),
+                409,
+            )
+
+        if not request_data.get("approved"):
+            plan_response = build_multi_write_plan(
+                project_name,
+                project_root,
+                files
+            )
+
+            if plan_response.get("success"):
+                # فقط Plan ساخته شد؛ هنوز هیچ Write یا
+                # Backup یا Journalی وجود ندارد.
+                return plan_response, 202
+
+            return plan_response, 400
+
+        # این نقطه فقط وقتی می‌رسد که کلاینت یک Plan را
+        # صریحاً تأیید کرده باشد؛ اجرای واقعی همچنان از
+        # مسیر canonical در agent.py انجام می‌شود.
+        result = execute_pending_action()
 
         if result:
             return (
@@ -2573,7 +2847,11 @@ def multi_write_route():
         return (
             jsonify({
                 "success": False,
-                "error": error_msg
+                "error": (
+                    error_msg
+                    or "Multi-file Write انجام نشد؛ هیچ تغییری "
+                    "روی دیسک ثبت نشد."
+                )
             }),
             400
         )
