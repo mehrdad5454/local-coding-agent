@@ -6457,6 +6457,22 @@ CANCEL_KEYWORDS = (
     "abort",
 )
 
+# پاسخ‌های کوتاهِ «برگرداندن آخرین تغییر».
+#
+# این کلیدواژه‌ها فقط یک «درخواست Undo» را تشخیص می‌دهند؛ خودِ
+# Undo را undo_last_mutating_action انجام می‌دهد که Safety خودش
+# را دارد (Emergency Stop، read-only، اعتبارسنجی candidate، journal
+# و Fail-Closed). اینجا هیچ مسیر موازی یا ایمنی جدیدی ساخته
+# نمی‌شود؛ فقط دروازهٔ ورودیِ همان تابع موجود است.
+UNDO_KEYWORDS = (
+    "واگرد",
+    "برگشت",
+    "بازگردان",
+    "بازگردانی",
+    "undo",
+    "revert",
+)
+
 # نشانههای درخواست چندمرحلهای (Agentic).
 LOOP_TRIGGER_KEYWORDS = (
     "مرحله به مرحله",
@@ -6734,6 +6750,19 @@ def detect_control_reply(user_request):
 
     if text in cancel_variants:
         return "cancel"
+
+    # «undo» عمداً آخرین بررسی است: اگر روزی کلیدواژه‌ای مشترک
+    # با تأیید/لغو اضافه شود، تأیید و لغو همچنان اولویت دارند.
+    undo_variants = set()
+
+    for keyword in UNDO_KEYWORDS:
+        undo_variants.add(keyword)
+        undo_variants.add(keyword + " کن")
+        undo_variants.add(keyword + " کنید")
+        undo_variants.add("please " + keyword)
+
+    if text in undo_variants:
+        return "undo"
 
     return None
 
@@ -13156,6 +13185,67 @@ def run_agent(
                 )
 
                 return approval_result
+
+            # مسیر Undo.
+            #
+            # این فقط دروازهٔ ورودی است: تشخیص پاسخ کوتاه
+            # «واگرد / undo» و صدا زدن همان
+            # undo_last_mutating_action موجود. تمام Safetyها
+            # (Emergency Stop، read-only، اعتبارسنجی candidate،
+            # journal و Fail-Closed) داخل همان تابع و دست‌نخورده
+            # باقی می‌مانند و اینجا چیزی موازی ساخته نمی‌شود.
+            #
+            # این مسیر عمداً قبل از routing معمولی است تا یک
+            # درخواست Undo هرگز وارد Agentic Loop نشود و Mutation
+            # تازه‌ای نسازد؛ و پاسخ همیشه با همان ساختار گزارش
+            # Agent برگردانده می‌شود.
+            if detect_control_reply(user_request) == "undo":
+                # project عمداً None است و این ضعف امنیتی نیست:
+                #
+                # ابزارهای پایه (write_file/edit_file و ...) در
+                # Journal فقط project_root را ثبت می‌کنند و نامِ
+                # نمایشی پروژه در آن‌ها null می‌ماند. بنابراین اگر
+                # نام پروژه را بدهیم، validate_undo_candidate همیشه
+                # آن را «متعلق به پروژه دیگری» رد می‌کند و Undo
+                # هرگز کار نمی‌کند.
+                #
+                # مرز واقعی و مؤثر، project_root است و همچنان کامل
+                # اعمال می‌شود: ریشهٔ ثبت‌شده با ریشهٔ فعلی مقایسه
+                # می‌شود، سپس before_state/sha1 و is_inside_project
+                # و idempotency کنترل می‌شوند. یعنی Undoی خارج از
+                # پروژه همچنان Fail-Closed است.
+                undo_ok, undo_reason, undo_result = (
+                    undo_last_mutating_action(
+                        project=None,
+                        project_root=project_root,
+                        allow_write=allow_write,
+                        stop_event=stop_event,
+                    )
+                )
+
+                undo_lines = [
+                    str(undo_reason),
+                ]
+
+                if not undo_ok:
+                    # بدون ادعای موفقیت: شکست Undo دقیقاً و با
+                    # همان دلیلِ برگشتی گزارش می‌شود.
+                    undo_lines.append(
+                        "هیچ تغییری برگردانده نشد."
+                    )
+
+                undo_report = build_report(
+                    "Undo",
+                    project_name,
+                    project_root,
+                    undo_lines,
+                )
+
+                remember_conversation_message(
+                    "agent", undo_report, project_name
+                )
+
+                return undo_report
 
             # Phase 2: Multi-Agent integration.
             # When use_multi_agent is True, delegate to SeniorAgent
