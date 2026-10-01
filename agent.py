@@ -216,6 +216,176 @@ def remove_project(project_name):
         save_projects(projects)
 
 
+# ---------------------------------------------------------
+# General Mode (بدون پروژه)
+# ---------------------------------------------------------
+#
+# General Mode یعنی «هیچ پروژه‌ای انتخاب نشده است».
+#
+# این حالت یک پروژهٔ جعلی نیست:
+#   * هیچ project_root ساخته یا جعل نمی‌شود،
+#   * هیچ مسیری به فایل‌سیستم نگاشت نمی‌شود،
+#   * safe_path و resolve_project_path دست‌نخورده می‌مانند.
+#
+# چون هیچ مسیر فایلی وجود ندارد، در General Mode فقط پاسخ
+# متنی/تحلیلی مدل مجاز است:
+#   * هیچ ابزار فایل‌محوری (read/write/edit/delete/move/
+#     create_directory/command) به مدل داده نمی‌شود،
+#   * هیچ مسیر نوشتن، Backup، Approval، Plan، Verify یا
+#     Journal وجود ندارد چون اصلاً mutationی ممکن نیست،
+#   * دستورهای کنترلی مثل «تأیید» یا «undo» در این حالت
+#     هیچ Pending Action را اجرا یا لغو نمی‌کنند.
+#
+# یعنی General Mode از نظر ایمنی Fail-Closed است: نبودِ
+# پروژه هرگز به دسترسی آزاد به مسیرهای دلخواه سیستم تبدیل
+# نمی‌شود.
+GENERAL_MODE_NAME = "general"
+
+GENERAL_MODE_NAMES = (
+    "",
+    GENERAL_MODE_NAME,
+    "general-mode",
+    "none",
+)
+
+
+def is_general_mode(project_name):
+    # فقط وقتی General Mode است که:
+    #   1) نامِ درخواستی یکی از نام‌های رزرو‌شدهٔ General
+    #      باشد، و
+    #   2) هیچ پروژهٔ واقعی با همان نام ثبت نشده باشد.
+    #
+    # شرط دوم لازم است تا یک پروژهٔ واقعی که کاربر نامش را
+    # «general» گذاشته، هرگز پشت General Mode پنهان نشود.
+    text = (
+        ""
+        if project_name is None
+        else str(project_name)
+    ).strip().lower()
+
+    if text not in GENERAL_MODE_NAMES:
+        return False
+
+    return get_project_path(project_name) is None
+
+
+def run_general_task(
+    user_request,
+    project_name=None,
+    allow_write=False,
+    stop_event=None,
+    progress=None,
+):
+    # General Mode: فقط پاسخ متنی/تحلیلی.
+    #
+    # این تابع عمداً هیچ ابزار فایل‌محوری را در اختیار مدل
+    # نمی‌گذارد و هیچ عملیات فایل‌سیستمی انجام نمی‌دهد.
+    # allow_write عمداً نادیده گرفته می‌شود: در General Mode
+    # «اعمال تغییر» وجود ندارد، چون هیچ پروژه/مسیری وجود
+    # ندارد. این نادیده‌گرفتن، مجوز نیست؛ جهت پیش‌فرض و
+    # امن همین است.
+    request_text = "" if user_request is None else str(user_request)
+
+    if not request_text.strip():
+        return "لطفاً یک درخواست وارد کنید."
+
+    label = GENERAL_MODE_NAME
+
+    # Emergency Stop همچنان بالاترین اولویت است؛ حتی در
+    # General Mode هیچ درخواست تازه‌ای اجرا نمی‌شود.
+    if is_stop_requested(stop_event):
+        return build_emergency_stop_report(
+            "General Mode",
+            label,
+            None,
+            notes=[
+                "درخواست در حالت عمومی و با Emergency Stop "
+                "فعال اجرا نشد؛ هیچ تغییری انجام نشد."
+            ],
+        )
+
+    # فرمان‌های کنترلی در General Mode هیچ Pending Action
+    # را تأیید/لغو/Undo نمی‌کنند. اگر Planی از Project Mode
+    # باقی مانده باشد، عمداً دست‌نخورده می‌ماند تا در همان
+    # پروژه و با همان Approval قانونی تصمیم‌گیری شود.
+    if detect_control_reply(request_text) is not None:
+        return build_report(
+            "General Mode",
+            label,
+            None,
+            [
+                "در حالت «بدون پروژه» هیچ Plan فعالی وجود "
+                "ندارد؛ هیچ تغییری انجام نشد.",
+                "برای تأیید یا لغو Plan، همان پروژه را "
+                "انتخاب کنید.",
+            ],
+        )
+
+    emit_progress(
+        progress,
+        "step_start",
+        step=1,
+        tool="general_mode",
+        detail="پاسخ متنی (بدون پروژه)",
+    )
+
+    history = get_recent_conversation_text(
+        project_name=None,
+        current_request=request_text,
+    )
+
+    user_prompt = ""
+
+    if history.strip():
+        user_prompt += (
+            "RECENT CONVERSATION:\n"
+            + history
+            + "\n\n"
+        )
+
+    user_prompt += (
+        "USER REQUEST:\n"
+        + request_text
+    )
+
+    answer = call_model(
+        """
+You are a helpful general-purpose assistant.
+
+You are in General Mode: NO project is selected.
+
+Rules you must follow:
+- Answer in text only.
+- You have NO access to any file, folder, project or command.
+  You cannot read, create, edit, delete, move or run anything.
+- If the request requires real files or a real project, say
+  clearly that you are in General Mode and that a project must be
+  selected, then explain what you can do without any file access.
+- Never claim that a file was read, created, changed, verified or
+  deleted. Never invent file contents or paths.
+- Be concise, concrete and useful.
+""",
+        user_prompt,
+        stop_event=stop_event,
+        no_think=False,
+    )
+
+    answer = "" if answer is None else str(answer).strip()
+
+    if not answer:
+        answer = (
+            "پاسخی تولید نشد. در حالت «بدون پروژه» فقط "
+            "پاسخ متنی ممکن است."
+        )
+
+    return build_report(
+        "General Mode",
+        label,
+        None,
+        [answer],
+    )
+
+
 APPROVAL_MODE_MANUAL = "manual"
 APPROVAL_MODE_AUTONOMOUS = "autonomous"
 
@@ -13215,6 +13385,8 @@ def run_agent(
     progress=None
 ):
     # دروازه ورودی Agent:
+    # 0) General Mode: بدون پروژه، فقط پاسخ متنی (هیچ ابزار
+    #    فایل‌محوری، هیچ مسیر، هیچ mutation)
     # 1) حافظه کوتاه گفتگو (in-memory)
     # 2) Gate تأیید Plan برای عملیات تغییردهنده
     # 3) Agentic Loop برای درخواستهای چندمرحلهای
@@ -13225,6 +13397,25 @@ def run_agent(
     remember_conversation_message(
         "user", user_request, project_name
     )
+
+    # General Mode قبل از هر مسیر دیگری:
+    # نه Approval، نه Undo، نه Agentic Loop و نه Legacy
+    # در این حالت اجرا نمی‌شوند. پروژهٔ انتخاب‌شده همچنان
+    # دقیقاً مثل قبل از همین خط عبور می‌کند.
+    if is_general_mode(project_name):
+        general_result = run_general_task(
+            user_request,
+            project_name=project_name,
+            allow_write=allow_write,
+            stop_event=stop_event,
+            progress=progress,
+        )
+
+        remember_conversation_message(
+            "agent", general_result, project_name
+        )
+
+        return general_result
 
     if project_root and os.path.isdir(project_root):
         try:

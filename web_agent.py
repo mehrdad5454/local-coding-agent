@@ -1334,6 +1334,10 @@ button:hover {
 <div class="project-row">
 
 <select id="project" name="project">
+    <option value="general"
+        {% if project_name == "general" %}selected{% endif %}>
+        General / بدون پروژه
+    </option>
 {% for name in projects %}
     <option value="{{ name }}"
         {% if project_name == name %}selected{% endif %}>
@@ -1349,7 +1353,7 @@ button:hover {
     + افزودن پروژه
 </button>
 
-{% if project_name != "agent-test" %}
+{% if project_name != "agent-test" and project_name != "general" %}
 <button
     type="button"
     class="small-button remove-button"
