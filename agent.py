@@ -1043,6 +1043,19 @@ def write_file_multi(
 
             existed_before = os.path.isfile(full_path)
 
+            # Undo پشتیبان: همان Backup استاندارد Single-file
+            # (create_backup) پیش از Write ساخته می‌شود تا Undo
+            # بتواند کل Batch را برگرداند.
+            #
+            # این Backup مسیر Rollback نیست: Rollback همچنان فقط از
+            # Backup معامله‌ای داخل پوشهٔ موقت انجام می‌شود، پس
+            # اتمیک‌بودن Batch دست‌نخورده می‌ماند. اگر Backup ساخته
+            # نشود، همان رفتار Single-file رخ می‌دهد: Write انجام
+            # نمی‌شود و کل Batch برمی‌گردد.
+            undo_backup_path = create_backup(
+                root, full_path
+            )
+
             if not action:
                 action = (
                     "modify"
@@ -1132,6 +1145,7 @@ def write_file_multi(
                     "relative_path": relative_path,
                     "action": action,
                     "backup_path": backup_path,
+                    "undo_backup_path": undo_backup_path,
                     "existed_before": existed_before
                 }
             )
@@ -1165,6 +1179,7 @@ def write_file_multi(
                     "full_path": full_path,
                     "action": action,
                     "backup_path": backup_path,
+                    "undo_backup_path": undo_backup_path,
                     "existed_before": existed_before,
                     "diff": diff,
                     "validation": validation,
@@ -1199,6 +1214,23 @@ def write_file_multi(
             root,
             written_entries
         )
+
+        # Backupهای Undo این تلاشِ ناموفق پاک می‌شوند: چون
+        # Rollback محتوا را به وضعیت قبل برگردانده، نگه‌داشتن آن‌ها
+        # فقط artifact یتیم می‌سازد. یک Batch ناموفق هرگز نباید
+        # Backup قابل Undo رها کند.
+        for entry in written_entries:
+            stale = entry.get("undo_backup_path")
+
+            if not stale:
+                continue
+
+            try:
+                if os.path.isfile(stale):
+                    os.remove(stale)
+
+            except Exception:
+                pass
 
         for entry in file_results:
             if entry["action"] == "modify":
@@ -7966,15 +7998,103 @@ UNDOABLE_ACTION_TYPES = (
     "create_directory",
     "move",
     "delete",
+    "multi_write",
 )
-
 UNDOABLE_TOOLS = (
     "write_file",
     "edit_file",
     "create_directory",
     "move_entry",
     "delete_entry",
+    "write_files",
 )
+
+# ---------------------------------------------------------
+# Stage 4 — Undo برای Batch چندفایلی
+# ---------------------------------------------------------
+# این بخش فقط «اطلاعات لازم برای Undo» را از همان نتیجهٔ واقعی
+# Write می‌سازد و همان contract تک‌فایلی را به‌کار می‌برد:
+# هر عضوِ ازپیش‌موجود با همان Backup استانداردِ create_backup
+# برگردانده می‌شود و هر عضوِ ساخته‌شده حذف می‌شود (همان رفتار
+# Undo یک Create).
+#
+# هیچ Schema جدیدی در Journal اختراع نشده: فقط همان dict
+# before_state که از قبل وجود دارد، یک کلید "files" می‌گیرد.
+
+
+def build_multi_write_undo_state(project_root, files_result):
+    # وضعیت قبلیِ هر عضو Batch، فقط از روی نتیجهٔ واقعی Write.
+    entries = []
+
+    for item in files_result or []:
+        if not isinstance(item, dict):
+            continue
+
+        rel = item.get("relative_path")
+        full = item.get("full_path")
+
+        if not rel or not full:
+            continue
+
+        entries.append({
+            "path": str(rel),
+            "full_path": os.path.abspath(str(full)),
+            "backup_path": item.get("undo_backup_path"),
+            "existed_before": bool(item.get("existed_before")),
+        })
+
+    return {
+        "type": "multi_write",
+        "count": len(entries),
+        "files": entries,
+    }
+
+
+def multi_write_target_label(before_state):
+    # target باید یک رشتهٔ غیرخالی باشد تا قرارداد موجودِ
+    # Action Context حفظ شود؛ مانند primary_target برای Batch.
+    files = (before_state or {}).get("files") or []
+    paths = sorted(str(item.get("path")) for item in files)
+
+    return ("multi_write:" + "|".join(paths))[:500]
+
+
+def record_multi_write_undo(
+    files_result,
+    project_root,
+    project=None,
+    args=None,
+    approval_state=ACTION_APPROVAL_APPROVED,
+    verified=True,
+    summary="multi-file batch executed"
+):
+    # ثبت Undo برای Batch موفق. فقط وقتی فراخوانی می‌شود که
+    # Write واقعاً موفق بوده باشد؛ Batch ناموفق هرگز اینجا
+    # نمی‌رسد پس هیچ Action ناقصی Undoable ثبت نمی‌شود.
+    before_state = build_multi_write_undo_state(
+        project_root, files_result
+    )
+
+    if not before_state.get("files"):
+        return None
+
+    return record_action(
+        "multi_write",
+        operation_class=ACTION_CLASS_USER,
+        tool="write_files",
+        args=args,
+        project=project,
+        project_root=project_root,
+        target=multi_write_target_label(before_state),
+        approval_state=approval_state,
+        validation_state=bool(verified),
+        before_state=before_state,
+        execution_state=ACTION_STATE_DONE,
+        verify_state=verify_state_from_bool(bool(verified)),
+        result_summary=summarize_action_result(summary),
+    )
+
+
 def _resolve_undo_backup_absolute(project_root, backup_ref, full_path=None):
     try:
         if not backup_ref or not project_root:
@@ -8055,7 +8175,73 @@ def validate_undo_candidate(action, project=None, project_root=None):
         before = action.get("before_state")
         if not isinstance(before, dict):
             return False, "اطلاعات وضعیت قبلی برای Undo کافی نیست.", None
+
         root = os.path.abspath(str(eroot))
+
+        # Batch چندفایلی: target یک Batch برچسب مرکب است، نه یک
+        # مسیر؛ بنابراین این شاخه پیش از resolve_project_pathِ
+        # تک‌عضوی می‌آید و مسیر واقعی هر عضو را خودش جداگانه
+        # اعتبارسنجی می‌کند.
+        #
+        # هر عضو ازپیش‌موجود باید Backup معتبر داشته باشد و هر عضو
+        # ساخته‌شده فقط باید داخل پروژه باشد (همان رفتار Undo یک
+        # Create).
+        if atype == "multi_write" or tool == "write_files":
+            batch_files = before.get("files")
+
+            if not isinstance(batch_files, list) or not batch_files:
+                return False, "اطلاعات اعضای Batch برای Undo کافی نیست.", None
+
+            resolved = []
+
+            for member in batch_files:
+                if not isinstance(member, dict):
+                    return False, "عضو Batch نامعتبر است.", None
+
+                mrel = member.get("path")
+
+                if not mrel or not str(mrel).strip():
+                    return False, "مسیر یک عضو Batch مشخص نیست.", None
+
+                try:
+                    mfull = resolve_project_path(root, str(mrel))
+                except Exception as e:
+                    return False, "مسیر یک عضو Batch نامعتبر است: " + str(e), None
+
+                if not is_inside_project(root, mfull):
+                    return False, "مسیر یک عضو Batch خارج از پروژه است.", None
+
+                existed = bool(member.get("existed_before"))
+                mbackup = None
+
+                if existed:
+                    mbackup = _resolve_undo_backup_absolute(
+                        root, member.get("backup_path"), mfull
+                    )
+
+                    if not mbackup:
+                        return False, "برای یکی از اعضای Batch نسخه Backup معتبر پیدا نشد.", None
+
+                resolved.append({
+                    "path": str(mrel),
+                    "full_path": mfull,
+                    "backup_abs": mbackup,
+                    "existed_before": existed,
+                })
+
+            return True, "", {
+                "action_id": aid,
+                "action_type": atype,
+                "tool": tool,
+                "project": eproj,
+                "project_root": root,
+                "target": str(target),
+                "full_path": None,
+                "backup_ref": bref,
+                "backup_abs": None,
+                "batch_files": resolved,
+            }
+
         try:
             full = resolve_project_path(root, str(target))
         except Exception as e:
@@ -8170,6 +8356,8 @@ def undo_last_mutating_action(project=None, project_root=None, allow_write=False
         atype = res.get("action_type")
         tool = res.get("tool")
         target = res.get("target")
+        if atype == "multi_write" or tool == "write_files":
+            return _undo_multi_write_action(action, res)
         if atype == "move" or tool == "move_entry":
             return _undo_move_action(action, res)
         if atype in ("create", "create_directory") or tool == "create_directory":
@@ -8179,6 +8367,86 @@ def undo_last_mutating_action(project=None, project_root=None, allow_write=False
         return _undo_backup_action(action, res)
     except Exception as e:
         return False, "Undo با خطای غیرمنتظره متوقف شد: " + str(e), None
+
+
+def _undo_multi_write_action(action, res):
+    # Undo کل Batch: هر عضو ازپیش‌موجود از همان Backup استاندارد
+    # برگردانده می‌شود و هر عضو ساخته‌شده حذف می‌شود — دقیقاً همان
+    # رفتاری که Undo یک Write و یک Create جداگانه دارد.
+    #
+    # این تابع هیچ قاعدهٔ جدیدی نمی‌سازد: برای هر عضو، همان
+    # validate/boundary/verify داخلی همان دو تابع موجود را صدا
+    # می‌زند. اگر یک عضو شکست بخورد، نتیجه صادقانه گزارش و Action
+    # «Undone» علامت نمی‌خورد تا کاربر بتواند دوباره تلاش کند.
+    try:
+        members = res.get("batch_files") or []
+        restored = []
+        removed = []
+        failures = []
+
+        for member in members:
+            single = {
+                "action_id": action.get("action_id"),
+                "action_type": action.get("action_type"),
+                "tool": action.get("tool"),
+                "project": action.get("project"),
+                "project_root": res.get("project_root"),
+                "target": member.get("path"),
+                "full_path": member.get("full_path"),
+                "backup_abs": member.get("backup_abs"),
+            }
+
+            if member.get("existed_before"):
+                ok, reason, _ = _undo_backup_action(action, single)
+            else:
+                ok, reason, _ = _undo_create_action(
+                    action,
+                    dict(
+                        single,
+                        before={"existed_before": False}
+                    )
+                )
+
+            if ok:
+                if member.get("existed_before"):
+                    restored.append(member.get("path"))
+                else:
+                    removed.append(member.get("path"))
+            else:
+                failures.append(
+                    str(member.get("path"))
+                    + ": "
+                    + str(reason)
+                )
+
+        if failures:
+            m = (
+                "Undo Batch کامل نشد: "
+                + " | ".join(failures)
+            )
+            remember_undo_result(action, res, ok=False, reason=m)
+            return False, "Undo انجام نشد: " + m, res
+
+        remember_undo_result(
+            action, res, ok=True, undone_via="multi-write-restore"
+        )
+
+        parts = []
+
+        if restored:
+            parts.append(
+                str(len(restored)) + " فایل بازگردانده شد"
+            )
+
+        if removed:
+            parts.append(
+                str(len(removed)) + " فایل ساخته‌شده حذف شد"
+            )
+
+        return True, "Undo انجام شد (" + ", ".join(parts) + ").", res
+    except Exception as e:
+        remember_undo_result(action, res, ok=False, reason=str(e))
+        return False, "Undo انجام نشد: " + str(e), res
 
 
 def _undo_move_action(action, res):
@@ -12960,6 +13228,26 @@ def execute_pending_action(stop_event=None):
 
     except Exception as e:
         result = tool_fail(e)
+
+    # Journal برای Batch: مسیر Canonical Manual Approval پیش‌تر
+    # هیچ Action قابل Undo ثبت نمی‌کرد، بنابراین Undo یک Batch
+    # موفق همیشه شکست می‌خورد.
+    #
+    # فقط وقتی ثبت می‌شود که همان Planِ تأییدشده واقعاً و بدون
+    # Rollback اجرا شده باشد (result.ok). اطلاعات Undo از همان
+    # نتیجهٔ واقعی write_file_multi خوانده می‌شود؛ هیچ Plan یا
+    # مسیر تازه‌ای ساخته نمی‌شود.
+    if tool_name == "write_files" and result.get("ok"):
+        multi_result = get_last_write_multi_result()
+
+        record_multi_write_undo(
+            files_result=(multi_result or {}).get("files") or [],
+            project_root=project_root,
+            project=project_name,
+            args=args,
+            approval_state=ACTION_APPROVAL_APPROVED,
+            verified=result.get("verified") is not False,
+        )
 
     entry = {
         "step": 1,
