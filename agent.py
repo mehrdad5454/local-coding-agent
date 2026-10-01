@@ -5319,6 +5319,29 @@ def is_write_allowed(permission):
     return permission is True
 
 
+# قرارداد Apply / Review (مرحله ۳):
+#
+#   Review (فقط بررسی) → read-only: فقط Read/Analysis/Plan.
+#                          هیچ mutation، هیچ Pending Action قابل
+#                          اجرا، هیچ Planِ قابل تأیید.
+#
+#   Apply (اعمال تغییر) → تنها یک مسیر canonical:
+#                          Plan → Re-validation → Approval
+#                          (یا autonomous) → Execute → Verify.
+#
+# مسیر Legacy از این پس هیچ Write مستقیمی ندارد. قبلاً در بعضی
+# شرایط (مثلاً وقتی routing حلقه را انتخاب نمی‌کرد یا وقتی مدل
+# در دسترس نبود و حلقه None برمی‌گرداند) مستقیماً
+# write_file را صدا می‌زد؛ یعنی Apply یک معنی دوم داشت که از
+# Plan/Re-validation/Approval/Verify عبور نمی‌کرد.
+LEGACY_DIRECT_WRITE_REFUSED = (
+    "در حالت «اعمال تغییر»، نوشتن مستقیم از مسیر Legacy مجاز "
+    "نیست؛ هیچ فایلی نوشته یا تغییر داده نشد.\n"
+    "هر تغییر باید از مسیر canonical بگذرد: "
+    "Plan → Re-validation → تأیید کاربر → Execute → Verify."
+)
+
+
 def collect_missing_path_tokens(
     project_root,
     user_request,
@@ -13604,9 +13627,32 @@ def run_agent(
                     except Exception:
                         pass
 
-            if should_use_agentic_loop(
+            # قرارداد Apply / Review (canonical mutation workflow)
+            #
+            # Review  → همان مسیر تشخیصیِ امروز؛ فقط خواندن،
+            #            تحلیل و Plan. بدون mutation.
+            #
+            # Apply   → همیشه Agentic Loop، بدون استثنا:
+            #            Plan → Re-validation → Approval (یا
+            #            autonomous) → Execute → Verify.
+            #
+            # دلیل اجباری‌کردن حلقه در Apply: routing قدیمی در
+            # بعضی درخواست‌ها حلقه را انتخاب نمی‌کرد و در نتیجه
+            # مسیر Legacy مستقیماً فایل را می‌نوشت؛ یعنی Apply
+            # بدون Plan/Approval/Verify یک معنی دوم داشت. حالا
+            # Apply فقط یک معنی دارد.
+            #
+            # تنها راه رسیدن به Legacy در Apply، fallbackِ
+            # «مدل در دسترس نیست» است؛ آن مسیر هم Fail-Closed
+            # است و هیچ Write مستقیمی ندارد.
+            use_agentic_loop = should_use_agentic_loop(
                 user_request, project_root
-            ):
+            )
+
+            if is_write_allowed(allow_write):
+                use_agentic_loop = True
+
+            if use_agentic_loop:
                 loop_result = run_agentic_loop(
                     user_request,
                     project_root,
@@ -13837,29 +13883,20 @@ END_CURRENT_FILE
                 new_content = extract_file_content(
                     model_output
                 )
+
                 if new_content is None:
                     return (
                         "مدل محتوای کامل فایل را "
                         "برنگرداند؛ بنابراین هیچ "
                         "تغییری اعمال نشد."
                     )
-                try:
-                    written_path = write_file(
-                        project_root,
-                        write_path,
-                        new_content,
-                    )
-                except Exception as e:
-                    return (
-                        "خطا در نوشتن فایل:\n"
-                        + str(e)
-                    )
-                return (
-                    "تغییر با موفقیت اعمال شد.\n"
-                    f"پروژه: {project_name}\n"
-                    f"فایل: {write_path}\n"
-                    f"مسیر: {written_path}"
-                )
+
+                # Fail-Closed: مسیر Legacy اجازهٔ Write مستقیم
+                # ندارد. این‌جا Plan/Re-validation/Approval/Verify
+                # وجود ندارد، پس حتی با allow_write=True نباید
+                # چیزی روی دیسک عوض شود.
+                return LEGACY_DIRECT_WRITE_REFUSED
+
             else:
                 requested_dir = find_requested_directory(
                     project_root, user_request
@@ -14073,22 +14110,7 @@ CURRENT CONTENT:
                 "تغییری اعمال نشد."
             )
 
-    try:
-        written_path = write_file(
-            project_root,
-            requested_file,
-            new_content
-        )
-
-    except Exception as e:
-        return (
-            "خطا در نوشتن فایل:\n"
-            + str(e)
-        )
-
-    return (
-        "تغییر با موفقیت اعمال شد.\n"
-        f"پروژه: {project_name}\n"
-        f"فایل: {requested_file}\n"
-        f"مسیر: {written_path}"
-    )
+    # Fail-Closed: مسیر Legacy اجازهٔ Write مستقیم ندارد.
+    # تنها مسیر مجاز برای تغییر فایل، مسیر canonical است
+    # (Plan → Re-validation → Approval → Execute → Verify).
+    return LEGACY_DIRECT_WRITE_REFUSED

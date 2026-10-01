@@ -54,6 +54,29 @@ CHAT_HISTORY_READ_LIMIT = 5
 CHAT_DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------
+# قرارداد حالت اجرا (Review / Apply)
+# ---------------------------------------------------------
+# دو حالت UI و دو معنی یکتا، بدون حالت سوم:
+#
+#   "read"  → Review: فقط بررسی/تحلیل/Plan. هیچ mutationی
+#             انجام نمی‌شود و هیچ Pending Action قابل اجرایی
+#             ساخته نمی‌شود.
+#   "write" → Apply: تنها مسیر canonical تغییر فایل در agent.py
+#             (Plan → Re-validation → Approval → Execute →
+#             Verify).
+#
+# allow_write فقط از همین نگاشت ساخته می‌شود؛ هیچ مسیر دیگری
+# در لایه web آن را نمی‌سازد.
+MODE_REVIEW = "read"
+MODE_APPLY = "write"
+
+
+def resolve_allow_write(mode):
+    # Fail-Closed: فقط mode == "write" مجوز Apply است.
+    return mode == MODE_APPLY
+
+
+# ---------------------------------------------------------
 # Runtime info (فقط لایه web؛ agent.py بی‌خبر است)
 # ---------------------------------------------------------
 # تنها منبع حقیقت provider/model برای Status Header و
@@ -2210,9 +2233,7 @@ def index():
                 del agent_progress[:]
                 last_result = ""
 
-                allow_write = (
-                    mode == "write"
-                )
+                allow_write = resolve_allow_write(mode)
 
                 global current_stop_event
                 stop_event = threading.Event()
@@ -2253,9 +2274,7 @@ def index():
                 del agent_progress[:]
                 last_result = ""
 
-                allow_write = (
-                    mode == "write"
-                )
+                allow_write = resolve_allow_write(mode)
 
                 stop_event = threading.Event()
                 current_stop_event = stop_event
