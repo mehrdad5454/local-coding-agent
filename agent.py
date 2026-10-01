@@ -863,6 +863,14 @@ def write_file_multi(
                     "Path is outside the selected project."
                 )
 
+            # مقصد نباید پوشه باشد؛ os.replace روی
+            # ویندوز وقتی مقصد یک پوشهٔ موجود باشد با
+            # [WinError 5] Access is denied شکست می‌خورد.
+            ensure_write_target_is_not_directory(
+                full_path,
+                relative_path,
+            )
+
             existed_before = os.path.isfile(full_path)
 
             if not action:
@@ -3626,6 +3634,45 @@ def is_probably_text_file(full_path):
     return extension in TEXT_FILE_EXTENSIONS
 
 
+def looks_like_file_path(relative_path):
+    # heuristic کم‌تهاجم برای تشخیص «این مسیر نام یک فایل
+    # را دارد، نه یک پوشه».
+    #
+    # عمداً فقط آخرین بخش مسیر بررسی می‌شود و فقط وقتی
+    # پسوند آن یک پسوند شناخته‌شده‌ی متنی/کد باشد. نام‌های
+    # رایج پوشه (docs, src, assets, node_modules) و حتی
+    # نام‌های دارای نقطه که پسوندشان شناخته‌شده نیست
+    # (مثل my.folder) بدون تغییر رفتار می‌مانند.
+    name = os.path.basename(
+        os.path.normpath(str(relative_path or ""))
+    )
+
+    if not name:
+        return False
+
+    extension = os.path.splitext(name)[1].lower()
+
+    return extension in TEXT_FILE_EXTENSIONS
+
+
+def ensure_write_target_is_not_directory(
+    full_path,
+    relative_path
+):
+    # Fail-Closed: نوشتن روی یک مسیرِ پوشه همیشه رد می‌شود.
+    #
+    # بدون این گارد، os.replace روی ویندوز وقتی مقصد یک
+    # پوشه‌ی موجود باشد با [WinError 5] Access is denied
+    # شکست می‌خورد و خطای گنگ از موتور نوشتن به مدل می‌رسد.
+    if not os.path.isdir(full_path):
+        return
+
+    raise ValueError(
+        "مسیر مقصد یک پوشه است، نه فایل: "
+        + str(relative_path)
+    )
+
+
 def scan_directory_entries(
     project_root,
     target,
@@ -4239,6 +4286,22 @@ def create_directory(
     if os.path.isfile(full_path):
         raise ValueError(
             "مسیر موردنظر یک فایل است، نه پوشه: "
+            + str(relative_path)
+        )
+
+    # ساخت پوشه‌ای که نامش مشخصاً نام یک فایل است
+    # (مثل index.html) همان ریشه‌ی خطای WinError 5 در
+    # Multi-file Write است: مدل به‌جای فایل، پوشه می‌سازد و
+    # بعد os.replace روی پوشه شکست می‌خورد. اینجا پیش از
+    # هر تغییری روی دیسک رد می‌شود تا بازخورد روشن به مدل
+    # برگردد. مسیرهای از قبل موجودِ پوشه دست‌نخورده می‌مانند.
+    if (
+        not os.path.isdir(full_path)
+        and looks_like_file_path(relative_path)
+    ):
+        raise ValueError(
+            "نام مسیر شبیه نام فایل است و ساختن آن به‌عنوان "
+            "پوشه اشتباه است: "
             + str(relative_path)
         )
 
@@ -9353,6 +9416,15 @@ def validate_mutating_args(project_root, tool_name, args,
                 project_root, entry["path"], user_request
             )
 
+            # Fail-Closed پیش از نمایش Plan: مقصدِ پوشه
+            # هرگز به Plan راه نمی‌برد.
+            ensure_write_target_is_not_directory(
+                resolve_project_path(
+                    project_root, entry["path"]
+                ),
+                entry["path"],
+            )
+
         return
 
     if tool_name == "move_entry":
@@ -9377,6 +9449,14 @@ def validate_mutating_args(project_root, tool_name, args,
     resolve_project_path(project_root, path)
 
     if tool_name in ("write_file", "edit_file"):
+        # Fail-Closed پیش از نمایش Plan: هدفِ پوشه رد می‌شود
+        # تا نه Plan اشتباه به کاربر نشان داده شود و نه
+        # موتور نوشتن با خطای مبهم مواجه شود.
+        ensure_write_target_is_not_directory(
+            resolve_project_path(project_root, path),
+            path,
+        )
+
         ensure_mutation_target_is_grounded(
             project_root, path, user_request
         )
