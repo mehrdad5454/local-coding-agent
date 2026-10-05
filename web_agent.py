@@ -502,6 +502,10 @@ def run_approval_background(
             control_text,
             allow_write=allow_write,
             stop_event=stop_event,
+            # Phase I — Project Context این درخواست به Gate
+            # داده می‌شود تا Approval صرفِ Planِ همان پروژه
+            # بشود، نه هر Planِ موجود در Slot سراسری.
+            expected_project=project_name,
         )
 
         if last_result is None:
@@ -2835,7 +2839,19 @@ def multi_write_route():
         # این نقطه فقط وقتی می‌رسد که کلاینت یک Plan را
         # صریحاً تأیید کرده باشد؛ اجرای واقعی همچنان از
         # مسیر canonical در agent.py انجام می‌شود.
-        result = execute_pending_action()
+        #
+        # Phase I — Pending Action Integrity.
+        #
+        # پیش از این تغییر این خط هیچ Contextی به Gate می‌داد و
+        # صرفاً Slot سراسری را اجرا می‌کرد. نتیجه: کلاینتی که
+        # approved=true می‌فرستاد می‌توانست با project و files
+        # دلخواه خودش، Planِ ساخته‌شده برای پروژه/فایل‌های
+        # کاملاً متفاوت را اجرا کند. حالا هر دو چیزی که این
+        # درخواست ادعا می‌کند باید با Plan داخل Slot یکی باشد.
+        result = execute_pending_action(
+            expected_project=project_name,
+            expected_args={"files": files},
+        )
 
         if result:
             return (

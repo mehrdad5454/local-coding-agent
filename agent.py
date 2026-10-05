@@ -94,6 +94,133 @@ def mask_sensitive_content(content):
     return content
 
 
+# ---------------------------------------------------------
+# Phase H — Sensitive Read Security Boundary
+# ---------------------------------------------------------
+#
+# این یک Security Boundary قطعی است، نه یک دستور Prompt.
+#
+# پیش از این لایه، تنها دو مجموعه‌ی «رد کردن» وجود داشت
+# (REVIEW_SKIP_BASENAMES / REVIEW_SKIP_SUFFIXES) که هر دو
+# مخصوص رتبه‌بندی و انتخاب فایل بودند و روی محتوا اثری
+# نداشتند. نتیجه این بود که read_file و search_in_files
+# محتوای خامِ فایل‌های حاوی credential را به مدل می‌دادند
+# و آن محتوا از راه observation به context مدل و سپس به
+# chat history می‌رسید. دستور Prompt در agent.py تنها
+# «خواندن این فایل‌ها ممنوع است» می‌گفت و هیچ چیزی آن را
+# اجرا نمی‌کرد.
+#
+# قاعده‌ی قطعی: اگر مسیر در فهرست زیر باشد، محتوا هرگز
+# برنمی‌گردد — نه به مدل، نه به observation، نه به
+# حافظه‌ی موقت. فقط یک پیام شفاف برمی‌گردد.
+#
+# عمداً فقط «خواندن» مسدود می‌شود. مسدودکردن Write یک
+# تصمیم جداگانه است و در محدوده‌ی این تغییر نیست.
+
+SENSITIVE_READ_BASENAMES = frozenset({
+    ".env",
+    "wp-config.php",
+    "credentials",
+    "htpasswd",
+    ".htpasswd",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "shadow",
+    "passwd",
+})
+
+SENSITIVE_READ_SUFFIXES = (
+    ".key",
+    ".pem",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".keystore",
+    ".ppk",
+    ".crt",
+    ".cer",
+    ".der",
+    ".asc",
+    ".gpg",
+    ".kdbx",
+)
+
+# پیشوند نام‌های حساس: .env، .env.local، .env.production، ...
+SENSITIVE_READ_PREFIXES = (".env",)
+
+# پسوندهایی که فایلِ حساس را با خود می‌برند: wp-config.php.bak،
+# .env.old، wp-config.php~ و مشابه. بدون این، یک کپی پشتیبان
+# راه دور زدن کامل denylist می‌شد.
+SENSITIVE_READ_ARTIFACT_SUFFIXES = (
+    ".bak", ".backup", ".old", ".orig", ".save", ".swp",
+    ".swo", ".tmp", ".copy", "~", ".1", ".2",
+)
+
+
+def is_sensitive_read_target(path):
+    """
+    Fail-Closed تشخیص مقصد حساس برای Read/Search.
+
+    ورودی می‌تواند نسبی، مطلق یا داخلی باشد؛ فقط نام فایل
+    ملاک است و همیشه به حروف کوچک سنجیده می‌شود.
+
+    خروجی:
+        False  → خواندن این مسیر مجاز است.
+        True   → محتوا نباید هرگز برگردد.
+    """
+    text = "" if path is None else str(path).replace("\\", "/")
+    text = text.strip()
+
+    if not text:
+        return False
+
+    name = text.rsplit("/", 1)[-1].strip().lower()
+
+    if not name:
+        return False
+
+    if name in SENSITIVE_READ_BASENAMES:
+        return True
+
+    for prefix in SENSITIVE_READ_PREFIXES:
+        if name == prefix or name.startswith(prefix + "."):
+            return True
+
+    for suffix in SENSITIVE_READ_SUFFIXES:
+        if name.endswith(suffix):
+            return True
+
+    # فایل حساسِ پشتیبان/موقت هم حساس است. این حلقه عمداً
+    # تکرار است تا نامِ پس از حذف پسوند هم دوباره سنجیده شود،
+    # ولی محدود است تا روی نام‌های عادی حلقه بی‌نهایت نیفتد.
+    for artifact in SENSITIVE_READ_ARTIFACT_SUFFIXES:
+        if name.endswith(artifact):
+            trimmed = name[:-len(artifact)].strip("._- ")
+
+            if trimmed and trimmed != name:
+                if is_sensitive_read_target(trimmed):
+                    return True
+
+    return False
+
+
+def sensitive_read_refusal_text(path):
+    # پیام مسدودسازی عمداً نام فایل و دلیل را می‌گوید تا مدل
+    # به‌جای حدس‌زدن، مسیر درست را از کاربر بپرسد. هیچ بخشی
+    # از محتوای فایل در این پیام افشا نمی‌شود.
+    return (
+        "خواندن «" + str(path) + "» مسدود است: این فایل "
+        " credential یا کلید رمزگذاری نگه می‌دارد و محتوایش "
+        "هرگز به مدل داده نمی‌شود. اگر واقعاً به آن نیاز "
+        "داری، از کاربر بخواه مقدار موردنیاز را خودش بگوید."
+    )
+
+
 def _load_projects_document():
     # کل فایل projects.json، شامل کلید رزرو‌شده‌ی approval mode.
     # فقط لایه‌ی داخلی از این استفاده می‌کند.
@@ -3804,40 +3931,116 @@ COMMAND_POLICY_BLOCKED_SUBCOMMANDS = {
     "npm": frozenset({
         "install", "i", "ci", "uninstall", "rm", "update",
         "publish", "exec", "init", "audit", "link", "dedupe",
+        # Phase H2 — اجرای script تعریف‌شده در package.json:
+        # کدی که قبلاً در پروژه نوشته شده اجرا می‌شود، پس نه
+        # قابل بازرسی در Plan است و نه Undo دارد.
+        "run", "run-script", "test", "start", "stop", "restart",
     }),
     "yarn": frozenset({
         "install", "add", "remove", "upgrade", "publish", "exec",
+        # Phase H2 — همان دلیل npm.
+        "run", "run-script", "test", "start", "stop", "restart",
     }),
     "pnpm": frozenset({
         "install", "i", "add", "remove", "update", "publish", "exec",
+        # Phase H2 — همان دلیل npm.
+        "run", "run-script", "test", "start", "stop", "restart",
     }),
     # npx هر Package نصب‌نشده‌ای را اجرا می‌کند؛
     # عملاً اجرای کد دلخواه از شبکه است.
     "npx": frozenset({"__all__"}),
     "composer": frozenset({
         "require", "install", "update", "remove", "create-project",
+        # Phase H2 — اجرای script تعریف‌شده در package.json /
+        # composer.json: کد دلخواهِ از پیش نوشته‌شده اجرا می‌شود،
+        # نه دستوری که کاربر همین حالا تأیید کرده است.
+        "run", "run-script", "test", "exec",
     }),
+}
+
+# Phase H2 — Flagهای اجرای کد دلخواه.
+#
+# اجازه‌ی «اجرای دستورِ تأییدشده» با اجازه‌ی «اجرای هر کدی که
+# کاربر خواسته» یکی نیست. وقتی خودِ مفسر در argv حاضر باشد،
+# بدنه‌ی کد داخل خودِ فرمان پنهان است و از Plan/Approval بیرون
+# می‌ماند؛ همچنین هیچ Backup یا Verify و در نتیجه هیچ Undoیی
+# وجود ندارد، چون run_command در UNDOABLE_TOOLS نیست.
+#
+# بنابراین flagهایی که کد را از خط فرمان به مفسر تزریق
+# می‌کنند مسدود می‌شوند. اجرای «فایلِ داخل پروژه» (مثل
+# python manage.py) مجاز می‌ماند، چون مسیر و محتوای آن فایل
+# روی دیسک قابل بازرسی است.
+COMMAND_POLICY_BLOCKED_FLAGS = {
+    "python": frozenset({"-c", "-m"}),
+    "python3": frozenset({"-c", "-m"}),
+    "py": frozenset({"-c", "-m"}),
+    "node": frozenset({"-e", "-p", "-r", "--eval", "--print",
+                       "--require"}),
+    "php": frozenset({"-r", "-S"}),
+}
+
+# Flagهای سراسری که یک مقدار مصرف می‌کنند.
+#
+# بدون این جدول، مقدارِ flag به‌عنوان «زیر‌دسته» اشتباه گرفته
+# می‌شد و کل Command Policy دور زده می‌شد:
+# «git -c core.pager=x checkout .» مقدارِ x را به‌جای checkout
+# می‌دید و مجاز اعلام می‌شد.
+COMMAND_POLICY_GLOBAL_VALUE_FLAGS = {
+    "git": frozenset({"-c"}),
 }
 
 
 def command_policy_denied_subcommand(tool, argv):
     # Phase 1 — Command Policy: Fail Closed.
-    # اولین توکنِ بدون «-» بعد از argv[0] زیر‌دسته واقعی
-    # است تا flagهای سراسری (مثل git --no-pager) آن را
-    # جابه‌جا نکنند. خروجی: None یا دلیل مسدودبودن.
-    blocked = COMMAND_POLICY_BLOCKED_SUBCOMMANDS.get(tool)
+    #
+    # دو چیز جدا باید سنجیده شود:
+    #   1) flag سراسری که کد دلخواه را تزریق می‌کند (مثل
+    #      «python -c» یا «node -e»)؛
+    #   2) زیر‌دسته‌ای که فایل پروژه را غیرقابل‌بازگشت
+    #      تغییر می‌دهد (مثل «git checkout» یا «npm run»).
+    #
+    # flagهای سراسری تا اولین توکنِ بدون «-» جاری هستند؛ دقیقاً
+    # همان‌جایی که مفسرها کد را قبول می‌کنند. flagهایی که یک
+    # مقدار مصرف می‌کنند، مقدارشان را هم می‌بلعند تا به‌اشتباه
+    # زیر‌دسته شمرده نشوند.
+    #
+    # خروجی: None یا دلیل مسدودبودن.
+    tokens = [str(item) for item in list(argv)[1:]]
 
-    if not blocked:
-        return None
+    blocked_flags = COMMAND_POLICY_BLOCKED_FLAGS.get(tool)
+    value_flags = COMMAND_POLICY_GLOBAL_VALUE_FLAGS.get(tool) or frozenset()
 
     subcommand = None
 
-    for token in list(argv)[1:]:
-        text = str(token)
+    index = 0
+
+    while index < len(tokens):
+        text = tokens[index]
 
         if not text.startswith("-"):
             subcommand = text.lower()
             break
+
+        if blocked_flags and text in blocked_flags:
+            return (
+                "flag «" + text + "» برای «" + tool + "» "
+                "طبق Command Policy مسدود است: این flag کد "
+                "دلخواه را از خط فرمان اجرا می‌کند، قابل بازرسی "
+                "در Plan نیست و Undo ندارد."
+            )
+
+        if text in value_flags:
+            # این flag یک مقدار مصرف می‌کند؛ آن مقدار نباید
+            # زیر‌دسته محسوب شود.
+            index += 2
+            continue
+
+        index += 1
+
+    blocked = COMMAND_POLICY_BLOCKED_SUBCOMMANDS.get(tool)
+
+    if not blocked:
+        return None
 
     if subcommand is None:
         # ابزار بدون زیر‌دسته اجرا نمی‌شود مگر آنکه
@@ -4234,6 +4437,14 @@ def search_in_files(
     results = []
 
     for full_path in files:
+        # Phase H — Security Boundary. حتی اگر کاربر صریحاً
+        # نام فایل حساس را جستجو کند، هیچ خطی از آن برگردانده
+        # نمی‌شود؛ بدون این، جستجو یک راه دور زدنِ Read بود.
+        if is_sensitive_read_target(
+            relative_display(root, full_path)
+        ):
+            continue
+
         if not is_probably_text_file(full_path):
             continue
 
@@ -4268,7 +4479,12 @@ def search_in_files(
                     root, full_path
                 ),
                 "line": line_number,
-                "text": line.strip()[:200],
+                # Phase H — لایه‌ی دوم: خطِ حاوی مقدار حساس
+                # حتی در فایل غیرحساس هم پیش از بازگشت Mask
+                # می‌شود، چون Search خودش یک مسیر نشت است.
+                "text": mask_sensitive_content(
+                    line.strip()[:200]
+                ),
             })
 
             if len(results) >= max_results:
@@ -4396,6 +4612,19 @@ def read_files_multi(
             "truncated": False,
             "error": None,
         }
+
+        # Phase H — Security Boundary. مسیر حساس قبل از هر I/O
+        # رد می‌شود، بنابراین حتی به‌طور موقت هم خوانده
+        # نمی‌شود. این‌جا عمداً raise نمی‌شود چون قرارداد این
+        # تابع «خطای یک فایل بقیه را متوقف نمی‌کند» است.
+        if is_sensitive_read_target(relative_path):
+            item["error"] = sensitive_read_refusal_text(
+                relative_path
+            )
+
+            results.append(item)
+
+            continue
 
         try:
             full_path = resolve_project_path(root, relative_path)
@@ -6039,6 +6268,20 @@ def handle_edit_intent(
 
     target = files[0]["relative_path"]
 
+    # Phase H — Security Boundary. این مسیر فایل را می‌خواند و
+    # مستقیم به call_model می‌دهد، پس مسدودسازی باید پیش از
+    # هر I/O انجام شود.
+    if is_sensitive_read_target(target):
+        return build_report(
+            "Execute (Edit)",
+            project_name,
+            project_root,
+            [
+                sensitive_read_refusal_text(target),
+                "هیچ تغییری انجام نشد.",
+            ]
+        )
+
     # Phase D — Safety Gate: بررسی قطعی مجوز قبل از خواندن و فراخوانی مدل
     if not is_write_allowed(allow_write):
         return build_report(
@@ -7181,6 +7424,144 @@ def _write_pending_action_file(action):
         raise
 
 
+def pending_action_plan_fingerprint(payload):
+    """
+    اثر انگشتِ محتواییِ یک Plan.
+
+    فقط چهار چیز هویتِ «این Plan» را می‌سازند: ابزار،
+    آرگومان‌ها، نام پروژه و ریشه‌ی پروژه. فیلدهای-volatile
+    مثل created_at یا read_paths عمداً وارد نمی‌شوند.
+
+    ورودی ناقص یا غیرقابل‌سریال‌سازی → Fail Closed (رشته‌ی
+    خالی)، تا هرگز با یک اثر انگشتِ ساختگی عبور نکند.
+    """
+    import hashlib
+
+    if not isinstance(payload, dict):
+        return ""
+
+    root = payload.get("project_root")
+
+    material = {
+        "tool": str(payload.get("tool") or ""),
+        "args": payload.get("args"),
+        "project": str(payload.get("project") or ""),
+        "project_root": (
+            os.path.abspath(str(root)) if root else ""
+        ),
+    }
+
+    try:
+        canonical = json.dumps(
+            material,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+
+        return hashlib.sha1(
+            canonical.encode("utf-8")
+        ).hexdigest()
+
+    except Exception:
+        return ""
+
+
+def pending_action_identity_status(
+    pending,
+    expected_project=None,
+    expected_args=None
+):
+    """
+    Phase I — Pending Action Integrity: Fail Closed.
+
+    خروجی: (ok, reason)
+
+    سه چیز جدا بررسی می‌شود:
+
+    1) هویت وجود دارد. Pending ساخته‌شده پیش از این لایه
+       (یا دستی‌سازی‌شده) plan_id ندارد و رد می‌شود؛ همان
+       الگوی «ساخته‌شده توسط نسخه قبلی» در Re-validation.
+
+    2) دست‌نخورده است. اثر انگشتِ ثبت‌شده با اثر انگشتِ
+       دوباره‌محاسبه‌شده از محتوای فعلی برابر باشد. پس هر
+       تغییرِ args/tool/project/project_root روی Pending
+       ذخیره‌شده یا روی فایل، لو می‌رود.
+
+    3) همان Context تأییدشده اجرا می‌شود. اگر caller بداند
+       کاربر روی کدام پروژه و کدام آرگومان‌ها Approval داده،
+       آن‌ها باید با Pending داخل Slot برابر باشند.
+
+    هیچ‌کدام از این‌ها به Re-validation وابسته نیست، چون
+    Re-validation فقط سازگاریِ داخلیِ Pending را می‌سنجد و
+    نمی‌تواند بداند کاربر کدام Plan را دیده بود.
+    """
+    if not isinstance(pending, dict):
+        return False, "Pending Action نامعتبر است."
+
+    plan_id = pending.get("plan_id")
+
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        return (
+            False,
+            "این Plan هویت ندارد (ساخته‌شده پیش از افزودن "
+            "شناسه یا دستی‌سازی‌شده)؛ اجرا نشد. برای اجرا، "
+            "درخواست را دوباره مطرح کنید.",
+        )
+
+    recorded = pending.get("plan_fingerprint")
+
+    if not isinstance(recorded, str) or not recorded.strip():
+        return False, "این Plan اثر انگشت معتبر ندارد؛ اجرا نشد."
+
+    recomputed = pending_action_plan_fingerprint(pending)
+
+    if not recomputed or recomputed != recorded:
+        return (
+            False,
+            "محتوای Plan با اثر انگشت ثبت‌شده هم‌خوانی ندارد؛ "
+            "Plan تغییر کرده یا قدیمی است و با Approval قبلی "
+            "قابل اجرا نیست.",
+        )
+
+    if expected_project is not None:
+        actual_project = str(pending.get("project") or "")
+
+        if actual_project != str(expected_project):
+            return (
+                False,
+                "Plan تأییدشده متعلق به پروژهٔ «"
+                + str(expected_project) + "» است، ولی Pending "
+                "موجود برای پروژهٔ «" + actual_project + "» است. "
+                "هیچ تغییری انجام نشد.",
+            )
+
+    if expected_args is not None:
+        expected_fingerprint = pending_action_plan_fingerprint({
+            "tool": pending.get("tool"),
+            "args": expected_args,
+            "project": pending.get("project"),
+            "project_root": pending.get("project_root"),
+        })
+        actual_fingerprint = pending_action_plan_fingerprint({
+            "tool": pending.get("tool"),
+            "args": pending.get("args"),
+            "project": pending.get("project"),
+            "project_root": pending.get("project_root"),
+        })
+
+        if not expected_fingerprint or (
+            expected_fingerprint != actual_fingerprint
+        ):
+            return (
+                False,
+                "Plan موجود در Slot با Plan تأییدشده یکی نیست؛ "
+                "هیچ تغییری انجام نشد.",
+            )
+
+    return True, ""
+
+
 def remember_pending_action(action):
     global PENDING_ACTION
 
@@ -7190,6 +7571,24 @@ def remember_pending_action(action):
         pending_action["created_at"] = time.time()
     except Exception:
         pass
+
+    # Phase I — Pending Action Integrity: هر Plan هنگام ایجاد
+    # هویت می‌گیرد تا Approval بعدی فقط روی همین Plan مصرف
+    # شود. این دو فیلد بعداً در pending_action_identity_status
+    # راستی‌آزمایی می‌شوند.
+    try:
+        import uuid
+
+        pending_action["plan_id"] = uuid.uuid4().hex
+    except Exception:
+        # Fail Closed: نبودِ شناسه یعنی Plan بعداً رد می‌شود،
+        # که بهتر از اجرای بدون هویت است.
+        pending_action["plan_id"] = ""
+
+    pending_action["plan_fingerprint"] = (
+        pending_action_plan_fingerprint(pending_action)
+    )
+
     _write_pending_action_file(pending_action)
     PENDING_ACTION = pending_action
 
@@ -7985,13 +8384,18 @@ def build_emergency_stop_report(
 def handle_pending_action_request(
     user_request,
     allow_write=False,
-    stop_event=None
+    stop_event=None,
+    expected_project=None
 ):
     # Gate تأیید:
     # - عملیات Read/Explore نیازی به تأیید ندارد.
     # - عملیات تغییردهنده اول Plan میدهد و منتظر
     #   تأیید کاربر میماند.
     # خروجی None یعنی «این درخواست مربوط به Gate نیست».
+    #
+    # Phase I: expected_project پروژه‌ای است که کاربر در UI
+    # انتخاب کرده و Plan را برای آن دیده. اگر Slot چیز دیگری
+    # داشته باشد، Approval مصرف نمی‌شود.
     control = detect_control_reply(user_request)
 
     if control == "cancel":
@@ -8073,7 +8477,8 @@ def handle_pending_action_request(
             return build_pending_expiration_report(pending)
 
         return execute_pending_action(
-            stop_event=stop_event
+            stop_event=stop_event,
+            expected_project=expected_project,
         )
 
     # درخواست جدید: Plan تأییدنشده منقضی میشود.
@@ -9238,11 +9643,20 @@ def tool_read_file(project_root, args):
     if not path:
         return tool_fail("آرگومان path لازم است.")
 
+    # Phase H — Security Boundary. قبل از هر I/O بررسی
+    # می‌شود تا حتی یک بایت از فایل حساس خوانده نشود.
+    if is_sensitive_read_target(path):
+        return tool_fail(sensitive_read_refusal_text(path))
+
     try:
         content = read_file(project_root, path)
 
     except Exception as e:
         return tool_fail(e)
+
+    # لایه‌ی دوم: حتی در فایل غیرحساس، مقادیر حساسِ
+    # درون‌متنی به مدل داده نمی‌شوند.
+    content = mask_sensitive_content(content)
 
     return tool_ok(
         content,
@@ -9269,9 +9683,22 @@ def tool_read_files(project_root, args):
                 item["relative_path"] + ": " + str(item["error"])
             )
         else:
+            # Phase H — Security Boundary. مسیر حساسِ باقی‌مانده
+            # هرگز وارد block نمی‌شود؛ فقط دلیل مسدودی گزارش
+            # می‌شود تا مدل بداند چرا فایل نبود.
+            if is_sensitive_read_target(item["relative_path"]):
+                blocks.append(
+                    "BEGIN_FILE " + item["relative_path"] + "\n"
+                    + sensitive_read_refusal_text(
+                        item["relative_path"]
+                    )
+                    + "\nEND_FILE " + item["relative_path"]
+                )
+                continue
+
             blocks.append(
                 "BEGIN_FILE " + item["relative_path"] + "\n"
-                + item["content"]
+                + mask_sensitive_content(item["content"])
                 + "\nEND_FILE " + item["relative_path"]
             )
 
@@ -11079,6 +11506,22 @@ def format_observation(
 
     text = result.get("text")
     limit = MAX_OBSERVATION_CHARS
+
+    # Phase H — لایه‌ی آخر (defense in depth).
+    #
+    # این نقطه تنها جایی است که هر متن ابزار پیش از ورود به
+    # context مدل از آن عبور می‌کند. مسدودسازیِ مسیرمحور در
+    # tool_read_file / read_files_multi / search_in_files انجام
+    # شده و برای Read/Search فعلی کافی است؛ این لایه فقط
+    # تضمین می‌کند که اگر مسیر Read جدیدی در آینده اضافه شد
+    # و فراموش شد، مقدار حساسِ درون‌متنی باز هم به مدل نرسد.
+    #
+    # عمداً کل observation را حذف نمی‌کنیم: یک Read عادی که
+    # فقط نام یک فایل حساس را در متن خود دارد (مثلاً «این
+    # فایل را نخواندم») باید سالم به مدل برسد. فقط مقدارِ
+    # حساس Mask می‌شود.
+    if text:
+        text = mask_sensitive_content(str(text))
 
     if (
         text
@@ -13236,12 +13679,47 @@ def run_agentic_loop(
     )
 
 
-def execute_pending_action(stop_event=None):
+def execute_pending_action(
+    stop_event=None,
+    expected_project=None,
+    expected_args=None
+):
     # اجرای Plan تأییدشده و ادامه حلقه برای Verify/Report.
+    #
+    # Phase I — Pending Action Integrity.
+    #
+    # expected_project / expected_args یعنی «Approvalی که کاربر
+    # داد متعلق به کدام پروژه و کدام آرگومان‌ها بود». بدون آن‌ها
+    # Slot سراسری هرچه در آن باشد اجرا می‌شد، یعنی Approvalِ
+    # داده‌شده برای یک Plan می‌توانست صرفِ Planِ دیگری در Slot
+    # شود. هر دو پارامتر اختیاری‌اند تا callerهایی که واقعاً
+    # Context را می‌دانند آن را بدهند؛ راستی‌آزماییِ داخلی
+    # (هویت + اثر انگشت) در هر حالت اجباری است.
     pending = get_pending_action()
 
     if pending is None:
         return None
+
+    # هویت قبل از هر چیز دیگری سنجیده می‌شود: قبل از
+    # Emergency Stop، قبل از TTL و قبل از Re-validation. دلیل
+    # ترتیب این است که یک Pending بی‌هویت یا تغییرکرده نباید
+    # حتی به‌عنوان «متوقف‌شده» یا «منقضی» هم پذیرفته شود.
+    identity_ok, identity_reason = pending_action_identity_status(
+        pending,
+        expected_project=expected_project,
+        expected_args=expected_args,
+    )
+
+    if not identity_ok:
+        return build_report(
+            "Execute (هویت Plan)",
+            pending.get("project"),
+            pending.get("project_root"),
+            [
+                identity_reason,
+                "هیچ فایلی نوشته یا تغییر داده نشد.",
+            ],
+        )
 
     # Phase C: Emergency Stop قبل از هر چیز.
     # Pending پاک نمیشود، Re-validation/Execute اجرا نمیشود و
@@ -14584,6 +15062,12 @@ REAL PROJECT STRUCTURE (root level):
 {structure}
 """
                 , stop_event=stop_event)
+
+    # Phase H — Security Boundary. این مسیر فایل را می‌خواند و
+    # مستقیم به call_model می‌دهد، پس مسدودسازی پیش از I/O
+    # لازم است.
+    if is_sensitive_read_target(requested_file):
+        return sensitive_read_refusal_text(requested_file)
 
     try:
         current_content = read_file(
