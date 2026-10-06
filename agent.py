@@ -14681,22 +14681,23 @@ def run_agent(
             # journal). Nothing here bypasses Emergency Stop.
             if use_multi_agent:
                 try:
+                    from agents.core_adapter import build_core_adapter
                     from agents.orchestrator import SeniorAgent
 
+                    core = build_core_adapter(
+                        call_model=call_model,
+                        read_file=read_file,
+                        safe_path=safe_path,
+                        search_in_files=search_in_files,
+                        is_write_allowed=is_write_allowed,
+                        is_stop_requested=is_stop_requested,
+                        record_action=record_action,
+                        mask_sensitive_content=mask_sensitive_content,
+                        stop_event=stop_event,
+                        submit_handler=handle_agent_batch_proposal,
+                    )
                     senior = SeniorAgent(
-                        tools={
-                            "call_model": call_model,
-                            "read_file": read_file,
-                            "safe_path": safe_path,
-                            # Phase 9 Section 2B: read-only project-wide
-                            # phrase search, shared with the sub-agents.
-                            # Read-only and bounded; no write capability.
-                            "search_in_files": search_in_files,
-                            "is_write_allowed": is_write_allowed,
-                            "is_stop_requested": is_stop_requested,
-                            "record_action": record_action,
-                            "mask_sensitive_content": mask_sensitive_content,
-                        },
+                        tools=core.tools_for_agent(),
                         stop_event=stop_event,
                     )
 
