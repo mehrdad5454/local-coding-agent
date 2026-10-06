@@ -3244,37 +3244,43 @@ def call_model(
     n_predict=None,
     no_think=False,
 ):
-    # Phase H: سقف تولید اختیاری.
-    # رفتار پیش‌فرض دقیقاً همان 1600 قبلی است تا هیچ مسیر
-    # Legacy ای تغییر نکند؛ فقط Agentic Loop سقف بزرگ‌تر
-    # می‌گیرد تا گزارش مشاوره‌ای ناقص تولید نشود.
-    token_limit = (
-        n_predict
-        if isinstance(n_predict, int) and n_predict > 0
-        else 1600
+    # Phase 2 — Provider Layer wiring (llama_cpp_local only).
+    #
+    # run_agent -> call_model -> Provider -> urllib -> llama-server.
+    # امضای عمومی، prompt، پارامترها، timeout، stop_event، نگاشت
+    # خطا و parse پاسخ دقیقاً مثل قبل حفظ شده‌اند؛ فقط ساخت
+    # endpoint/payload/header به agents/providers.py سپرده شده است.
+    # import به‌صورت lazy است تا circular import ایجاد نشود.
+    # هیچ fallback خاموشی به transport inline وجود ندارد: شکست
+    # Provider صریح و قابل تشخیص است (RuntimeError پیش از هر request).
+    try:
+        from agents import providers as _providers
+    except Exception as e:
+        raise RuntimeError(
+            f"خطا در بارگذاری Provider مدل: {e}"
+        )
+
+    try:
+        _spec = _providers.default_provider()
+        _endpoint = _providers.resolve_endpoint(_spec)
+        _headers = _providers.build_headers(_spec)
+    except Exception as e:
+        raise RuntimeError(
+            f"خطا در پیکربندی Provider مدل: {e}"
+        )
+
+    if not _spec.uses_raw_prompt:
+        raise RuntimeError(
+            "Provider فعال با مسیر llama-server سازگار نیست."
+        )
+
+    payload = _providers.build_payload(
+        _spec,
+        system_prompt,
+        user_prompt,
+        n_predict=n_predict,
+        no_think=no_think,
     )
-
-    if no_think:
-        user_prompt = user_prompt + "\n\n/no_think"
-
-    prompt = (
-        "<|im_start|>system\n"
-        + system_prompt
-        + "<|im_end|>\n"
-        + "<|im_start|>user\n"
-        + user_prompt
-        + "<|im_end|>\n"
-        + "<|im_start|>assistant\n"
-    )
-
-    payload = {
-        "prompt": prompt,
-        "n_predict": token_limit,
-        "temperature": 0.1,
-        "repeat_penalty": 1.1,
-        "stop": ["<|im_end|>"],
-        "stream": False
-    }
 
     data = json.dumps(
         payload,
@@ -3282,11 +3288,9 @@ def call_model(
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        MODEL_URL,
+        _endpoint,
         data=data,
-        headers={
-            "Content-Type": "application/json"
-        },
+        headers=_headers,
         method="POST"
     )
 
