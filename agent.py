@@ -470,6 +470,18 @@ def run_general_task(
             + "\n\n"
         )
 
+    # Phase 4 — Durable Memory (flag-gated). OFF by default: no change.
+    relevant_memory = _get_durable_memory_text(
+        request_text, project_name=project_name
+    )
+
+    if relevant_memory.strip():
+        user_prompt += (
+            "RELEVANT MEMORY:\n"
+            + relevant_memory
+            + "\n\n"
+        )
+
     user_prompt += (
         "USER REQUEST:\n"
         + request_text
@@ -7328,6 +7340,83 @@ def get_recent_conversation_text(
     return "\n".join(lines)
 
 
+# Phase 4 — Durable Memory wiring (flag-gated, fail-safe).
+#
+# agent.py owns NO memory logic: recall/record policy lives in
+# agents/memory_adapter.py. These helpers are pure wiring: a feature
+# flag, a lazy per-path singleton, and fail-safe call sites. When the
+# flag is OFF (default) every helper is a no-op and prompts are
+# byte-identical to before. No Safety Spine function is touched, and
+# memory/sqlite are never imported at module top (lazy, inside the
+# factory) so a memory failure can never break agent import.
+LOCAL_AGENT_MEMORY_ENV_FLAG = "LOCAL_AGENT_MEMORY_ENABLED"
+LOCAL_AGENT_MEMORY_DB_ENV = "LOCAL_AGENT_MEMORY_DB_PATH"
+
+_DURABLE_MEMORY_ADAPTERS = {}
+_DURABLE_MEMORY_LOCK = threading.Lock()
+
+
+def is_durable_memory_enabled():
+    try:
+        return (
+            os.environ.get(LOCAL_AGENT_MEMORY_ENV_FLAG, "")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
+    except Exception:
+        return False
+
+
+def _get_durable_memory_adapter():
+    try:
+        db_path = os.environ.get(LOCAL_AGENT_MEMORY_DB_ENV, "").strip() or None
+    except Exception:
+        db_path = None
+    key = db_path or "<default>"
+    adapter = _DURABLE_MEMORY_ADAPTERS.get(key)
+    if adapter is not None:
+        return adapter
+    with _DURABLE_MEMORY_LOCK:
+        adapter = _DURABLE_MEMORY_ADAPTERS.get(key)
+        if adapter is not None:
+            return adapter
+        try:
+            from agents.memory_adapter import build_memory_adapter
+        except Exception:
+            return None
+        try:
+            adapter = build_memory_adapter(db_path=db_path)
+        except Exception:
+            return None
+        _DURABLE_MEMORY_ADAPTERS[key] = adapter
+        return adapter
+
+
+def _get_durable_memory_text(query, project_name=None):
+    try:
+        if not is_durable_memory_enabled():
+            return ""
+        adapter = _get_durable_memory_adapter()
+        if adapter is None:
+            return ""
+        return adapter.recall_for_prompt(query, project=project_name or "")
+    except Exception:
+        return ""
+
+
+def _record_durable_interaction(user_text, agent_text, project_name=None):
+    try:
+        if not is_durable_memory_enabled():
+            return
+        adapter = _get_durable_memory_adapter()
+        if adapter is None:
+            return
+        adapter.record_interaction(
+            user_text, agent_text, project=project_name or ""
+        )
+    except Exception:
+        return
+
+
 def normalize_control_reply_text(text):
     # نرمال‌سازی محدود و مشترک پاسخ Approval (تأیید/لغو).
     # فقط شکل نوشتاری را یکسان می‌کند: الف/همزه عربی
@@ -11209,6 +11298,16 @@ def build_loop_user_prompt(
         parts.append(history)
         parts.append("")
 
+    # Phase 4 — Durable Memory (flag-gated). OFF by default: no change.
+    relevant_memory = _get_durable_memory_text(
+        user_request, project_name=project_name
+    )
+
+    if relevant_memory.strip():
+        parts.append("RELEVANT MEMORY:")
+        parts.append(relevant_memory)
+        parts.append("")
+
     parts.append("CURRENT REQUEST:")
     parts.append(str(user_request))
     parts.append("")
@@ -14461,6 +14560,11 @@ def run_agent(
             "agent", general_result, project_name
         )
 
+        # Phase 4 — Durable Memory record (flag-gated, never fails).
+        _record_durable_interaction(
+            user_request, general_result, project_name=project_name
+        )
+
         return general_result
 
     if project_root and os.path.isdir(project_root):
@@ -14697,6 +14801,11 @@ def run_agent(
                         "agent", loop_result, project_name
                     )
 
+                    # Phase 4 — Durable Memory record (flag-gated).
+                    _record_durable_interaction(
+                        user_request, loop_result, project_name=project_name
+                    )
+
                     return loop_result
 
                 # Phase 1: canonical path unavailable (model down).
@@ -14763,6 +14872,11 @@ def run_agent(
             "agent", result, project_name
         )
 
+        # Phase 4 — Durable Memory record (flag-gated, never fails).
+        _record_durable_interaction(
+            user_request, result, project_name=project_name
+        )
+
         return result
 
     try:
@@ -14792,6 +14906,11 @@ def run_agent(
 
     remember_conversation_message(
         "agent", result, project_name
+    )
+
+    # Phase 4 — Durable Memory record (flag-gated, never fails).
+    _record_durable_interaction(
+        user_request, result, project_name=project_name
     )
 
     return result
