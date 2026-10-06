@@ -28,10 +28,15 @@ from agent import (
     get_pending_action,
     handle_pending_action_request,
     is_stop_requested,
+    # Phase K — Chat History redaction reuses the Core masker, so the
+    # history boundary and the model boundary apply the same rules.
+    mask_sensitive_content,
 )
 import os
 import time
 import re
+import hmac
+import secrets
 import sqlite3
 import tkinter as tk
 from tkinter import filedialog
@@ -71,6 +76,74 @@ def is_local_origin(origin):
         return False
 
     return match.group(2).lower() in LOCAL_ORIGIN_HOSTS
+
+
+# ---------------------------------------------------------
+# Phase J — CSRF Protection
+# ---------------------------------------------------------
+#
+# ریشهٔ مشکل: قبل از این لایه، بررسی Origin فقط در شاخهٔ
+# OPTIONS انجام می‌شد. یک POST واقعی هرگز Origin آن سنجیده
+# نمی‌شد و هیچ tokenی هم وجود نداشت. چون form POST با
+# Content-Type ساده (multipart/urlencoded) هیچ preflightی
+# نمی‌فرستد، مرورگر درخواست را بدون رنگ اجرا می‌کند و فقط
+# پاسخ را نمی‌دهد. یعنی یک صفحهٔ وبِ دلخواه می‌توانست:
+#   • /rollback را با mode=write صدا بزند و فایل پروژه را از
+#     Backup بازنویسی کند،
+#   • /remove-project را صدا بزند و پروژه را از پیکربندی
+#     حذف کند،
+#   • / را با mode=write صدا بزند و یک اجرای Apply را آغاز
+#     کند.
+# محدودکردن Origin به‌تنهایی کافی نیست چون به رفتار مرورگر
+# تکیه می‌کند؛ پس هر دو لایه اعمال می‌شوند:
+#   1) هر درخواستِ تغییردهنده با Origin غیرمحلی رد می‌شود،
+#   2) هر درخواستِ تغییردهنده باید token درست را داشته باشد.
+
+# یک token به‌ازای هر process. چون سرور فقط روی 127.0.0.1
+# گوش می‌دهد، token با هر بار راه‌اندازی عوض می‌شود و هیچ
+# چیزی روی دیسک نوشته نمی‌شود.
+CSRF_TOKEN = secrets.token_hex(32)
+CSRF_FIELD_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+
+STATE_CHANGING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+def submitted_csrf_token():
+    # token می‌تواند در سه جا بیاید: header (برای fetch)، فرم
+    # (برای form POST) یا بدنهٔ JSON (برای /multi-write).
+    token = request.headers.get(CSRF_HEADER_NAME, "")
+
+    if not token:
+        token = request.form.get(CSRF_FIELD_NAME, "")
+
+    if not token and request.is_json:
+        payload = request.get_json(silent=True)
+
+        if isinstance(payload, dict):
+            token = payload.get(CSRF_FIELD_NAME, "")
+
+    return str(token or "")
+
+
+def csrf_token_is_valid():
+    submitted = submitted_csrf_token()
+
+    if not submitted:
+        return False
+
+    return hmac.compare_digest(
+        submitted.encode("utf-8", "replace"),
+        CSRF_TOKEN.encode("utf-8"),
+    )
+
+
+def reject_forged_request(reason):
+    return app.make_response((
+        "این درخواست معتبر نیست؛ هیچ عملیاتی انجام نشد. "
+        + reason,
+        403,
+    ))
 
 # نگهداری event مربوط به اجرای فعال Agent
 # برای امکان توقف اجرای در حال انجام از رابط وب
@@ -234,6 +307,31 @@ def init_chat_db():
 init_chat_db()
 
 
+def redact_for_chat_history(text):
+    """
+    Phase K — S4: پیش از نوشتن در SQLite.
+
+    chat-history.db یک ماندگار است: هرچه یک‌بار داخل آن
+    نوشته شود، حتی بعد از پاک‌کردن متن از صفحه باقی می‌ماند و
+    در backupهای کاربر هم دیده می‌شود. به همین دلیل هم prompt
+    و هم response پیش از INSERT از همان masker استفاده
+    می‌کنند که خود agent.py در مرزِ ورودی مدل می‌گذارد؛ پس
+    چیزی که ذخیره می‌شود دقیقاً همان چیزی است که مدل دیده.
+
+    Fail Closed: اگر Mask به هر دلیل خطا بدهد، متن خام ذخیره
+    نمی‌شود؛ یک اعلان جای آن را می‌گیرد. نگه‌داشتنِ خام در
+    حالت خطا دقیقاً همان نشتی است که این لایه برای بستنش
+    اضافه شده.
+    """
+    if text is None:
+        return ""
+
+    try:
+        return mask_sensitive_content(str(text))
+    except Exception:
+        return "[REDACTED: chat history redaction failed]"
+
+
 def remember_chat_turn(
     project_name,
     prompt,
@@ -248,8 +346,10 @@ def remember_chat_turn(
     row = (
         time.time(),
         project_name or "",
-        prompt or "",
-        strip_think_tags(response) or "",
+        # Phase K — S4: تنها مرزِ persistence همین INSERT است، پس
+        # هر دو متن درست اینجا و پیش از هر نوشتنی پاک می‌شوند.
+        redact_for_chat_history(prompt),
+        redact_for_chat_history(strip_think_tags(response)),
         state,
         provider if provider is not None else RUNTIME_PROVIDER,
         model if model is not None else RUNTIME_MODEL,
@@ -448,8 +548,27 @@ def handle_cors_preflight():
         resp.headers["Access-Control-Allow-Methods"] = (
             "GET, POST, OPTIONS"
         )
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, " + CSRF_HEADER_NAME
+        )
         return resp
+
+    # Phase J — CSRF: همان دروازه، حالا برای خودِ درخواست‌های
+    # تغییردهنده هم، نه فقط preflight.
+    #
+    # ترتیب عمدی است: اول Origin، بعد token. یک درخواست جعلی
+    # معمولاً هر دو را ندارد، و پیام خطا نباید وجود token را
+    # به مهاجم لو بدهد.
+    if request.method in STATE_CHANGING_METHODS:
+        if not is_local_origin(origin):
+            return reject_forged_request(
+                "Origin این درخواست محلی نیست."
+            )
+
+        if not csrf_token_is_valid():
+            return reject_forged_request(
+                "توکن CSRF وجود ندارد یا نادرست است."
+            )
 
 
 # ---------------------------------------------------------
@@ -1429,6 +1548,8 @@ button:hover {
 
 <form method="post" id="agentForm">
 
+<input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+
 <label for="project">پروژه</label>
 
 <div class="project-row">
@@ -1450,6 +1571,11 @@ button:hover {
     method="post"
     action="/add-project"
     style="display:inline">
+    <input
+        type="hidden"
+        name="{{ csrf_field }}"
+        value="{{ csrf_token }}"
+    >
     <button
         type="submit"
         class="small-button">
@@ -1462,6 +1588,11 @@ button:hover {
     method="post"
     action="/remove-project"
     style="display:inline">
+    <input
+        type="hidden"
+        name="{{ csrf_field }}"
+        value="{{ csrf_token }}"
+    >
     <input
         type="hidden"
         name="name"
@@ -1629,6 +1760,12 @@ button:hover {
 
         <input
             type="hidden"
+            name="{{ csrf_field }}"
+            value="{{ csrf_token }}"
+        >
+
+        <input
+            type="hidden"
             name="project"
             value="{{ project_name | e }}"
         >
@@ -1722,6 +1859,12 @@ button:hover {
 
         <input
             type="hidden"
+            name="{{ csrf_field }}"
+            value="{{ csrf_token }}"
+        >
+
+        <input
+            type="hidden"
             name="project"
             value="{{ project_name | e }}"
         >
@@ -1812,7 +1955,8 @@ function stopAgent() {
     fetch("/stop", {
         method: "POST",
         headers: {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-CSRF-Token": "{{ csrf_token }}"
         }
     })
     .then(function(response) {
@@ -2429,6 +2573,10 @@ def index():
         status_text=status_text,
         status_class=status_class,
         status_badge=status_badge,
+        # Phase J — CSRF: توکن و نام فیلدش به قالب داده می‌شوند
+        # تا هر form و fetch آن را همراه بفرستد.
+        csrf_token=CSRF_TOKEN,
+        csrf_field=CSRF_FIELD_NAME,
     )
 
 
@@ -2628,6 +2776,9 @@ def rollback_route():
         status_text="",
         status_class="idle",
         status_badge="",
+        # Phase J — CSRF (همان دو متغیرِ صفحهٔ اصلی).
+        csrf_token=CSRF_TOKEN,
+        csrf_field=CSRF_FIELD_NAME,
     )
 
 

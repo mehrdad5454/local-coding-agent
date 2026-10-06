@@ -52,7 +52,11 @@ def check(name, condition):
 
 
 def post(client, action, mode):
+    # Phase J: since the CSRF boundary landed, every state-changing
+    # POST must carry the process token. Self-check stays a
+    # legitimate local client instead of a forged one.
     return client.post("/", data={
+        "csrf_token": web_agent.CSRF_TOKEN,
         "approval_action": action,
         "project": "selftest",
         "mode": mode,
