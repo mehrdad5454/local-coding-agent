@@ -213,6 +213,9 @@ class SeniorAgent(Agent):
         # Phase 7: Persona registry for resolving sub-agent personas.
         # If not provided, use the default registry.
         self.persona_registry: PersonaRegistry = persona_registry or create_default_registry()
+        # Phase 7-A: (agent_id, agent_type) that produced the current
+        # run()'s answer — evidence only, reset at the start of run().
+        self._proposal_origin = None
 
     def run(self, task: str, **kwargs) -> str:
         """
@@ -236,6 +239,9 @@ class SeniorAgent(Agent):
         stop_event = kwargs.get("stop_event") or self._shared_stop_event
         user_request = kwargs.get("user_request", task)
 
+        # Phase 7-A: reset per-request evidence state.
+        self._proposal_origin = None
+
         # Check for emergency stop using the shared event.
         if self._is_stopped(stop_event):
             return (
@@ -245,6 +251,14 @@ class SeniorAgent(Agent):
 
         # Phase 3: Check if this is a marketing content request.
         if self._is_marketing_request(user_request):
+            self._proposal_origin = ("marketing_agent", "specialist")
+            self._journal_evidence(
+                "agent_routing",
+                agent_id="orchestrator",
+                agent_type="orchestrator",
+                project_name=project_name,
+                args={"route": "marketing", "request": user_request[:100]},
+            )
             return self._delegate_to_subagent(
                 agent_type="marketing",
                 task=user_request,
@@ -257,6 +271,14 @@ class SeniorAgent(Agent):
 
         # Phase 4: Check if this is a research/analysis request.
         if self._is_research_request(user_request):
+            self._proposal_origin = ("research_agent", "specialist")
+            self._journal_evidence(
+                "agent_routing",
+                agent_id="orchestrator",
+                agent_type="orchestrator",
+                project_name=project_name,
+                args={"route": "research", "request": user_request[:100]},
+            )
             return self._delegate_to_subagent(
                 agent_type="research",
                 task=user_request,
@@ -269,6 +291,14 @@ class SeniorAgent(Agent):
 
         # Phase 5: Check if this is an opportunity analysis request.
         if self._is_opportunity_request(user_request):
+            self._proposal_origin = ("opportunity_agent", "specialist")
+            self._journal_evidence(
+                "agent_routing",
+                agent_id="orchestrator",
+                agent_type="orchestrator",
+                project_name=project_name,
+                args={"route": "opportunity", "request": user_request[:100]},
+            )
             return self._delegate_to_subagent(
                 agent_type="opportunity",
                 task=user_request,
@@ -282,6 +312,13 @@ class SeniorAgent(Agent):
         # Phase 6: content-file request -> ContentSpecialist (Analyze->Propose).
         # Checked AFTER the registered agents so their routing never changes.
         if self._is_content_file_request(user_request):
+            self._journal_evidence(
+                "agent_routing",
+                agent_id="orchestrator",
+                agent_type="orchestrator",
+                project_name=project_name,
+                args={"route": "content", "request": user_request[:100]},
+            )
             specialist_result = self._delegate_to_content_specialist(
                 user_request,
                 project_name=project_name,
@@ -290,9 +327,21 @@ class SeniorAgent(Agent):
                 stop_event=stop_event,
             )
             if specialist_result is not None:
+                # The specialist produced the answer → it is the producer.
+                self._proposal_origin = ("content_specialist", "specialist")
                 return specialist_result
+            # Delegation failed → falls through; the skeleton below
+            # becomes the producer (orchestrator).
 
         # Fallback: skeleton analysis for unrecognized requests.
+        self._proposal_origin = ("orchestrator", "orchestrator")
+        self._journal_evidence(
+            "agent_routing",
+            agent_id="orchestrator",
+            agent_type="orchestrator",
+            project_name=project_name,
+            args={"route": "skeleton", "request": user_request[:100]},
+        )
         return self._analyze_request(
             task,
             project_name=project_name,
@@ -324,13 +373,89 @@ class SeniorAgent(Agent):
         if not isinstance(answer, str):
             return answer, None
 
-        return answer, extract_agent_proposal(answer)
+        proposal = extract_agent_proposal(answer)
+
+        if proposal:
+            # Phase 7-A: proposal evidence (observability only). Names the
+            # producer and the executor BEFORE any approval happens;
+            # execution and every safety decision stay in the Core, which
+            # never reads this record back.
+            origin = self._proposal_origin or ("orchestrator", "orchestrator")
+            files = [
+                str(item.get("path") or "")
+                for item in (proposal.get("files") or [])
+            ]
+            self._journal_evidence(
+                "agent_proposal",
+                agent_id=origin[0],
+                agent_type=origin[1],
+                project_name=str(kwargs.get("project_name", "unknown")),
+                args={
+                    "executor": "core",
+                    "files": [path for path in files if path],
+                },
+                result_summary=(
+                    "proposal created by %s; executor=core" % (origin[0],)
+                ),
+            )
+
+        return answer, proposal
 
     def _is_stopped(self, stop_event) -> bool:
         """Check if the shared stop_event is set."""
         if stop_event is None:
             return False
         return stop_event.is_set()
+
+    # Phase 7-A — Evidence records (observability only).
+    #
+    # "agent_routing" / "agent_proposal" / "agent_delegation" are plain
+    # journal entries: nothing in approval, execution or the Safety Spine
+    # ever reads them back. record_action is injected by the Core; when
+    # absent (unit tests), every helper is a no-op. The journal must never
+    # break a run, so every call is guarded.
+
+    def _journal_evidence(
+        self,
+        action_type: str,
+        agent_id: str,
+        agent_type: str,
+        project_name: str = "",
+        args: Optional[dict] = None,
+        result_summary: Optional[str] = None,
+        execution_state: Optional[str] = None,
+    ) -> None:
+        """Best-effort evidence record; never raises, never gates."""
+        record_action = self.tools.get("record_action")
+        if record_action is None:
+            return
+        fields = dict(
+            action_type=action_type,
+            tool="orchestrator",
+            # Literal "read": same value as agent.ACTION_CLASS_READ;
+            # written as a literal so agents/ never imports agent.py.
+            operation_class="read",
+            args=dict(args or {}),
+            project=project_name,
+            agent_id=agent_id,
+            agent_type=agent_type,
+        )
+        if result_summary is not None:
+            fields["result_summary"] = result_summary
+        if execution_state is not None:
+            fields["execution_state"] = execution_state
+        try:
+            record_action(**fields)
+        except Exception:
+            pass
+
+    def get_proposal_origin(self):
+        """Phase 7-A: (agent_id, agent_type) that produced the answer.
+
+        Returns None when no routed answer was produced (e.g. the run
+        was rejected before routing). Evidence only.
+        """
+        return self._proposal_origin
 
     def _is_marketing_request(self, user_request: str) -> bool:
         """
@@ -453,6 +578,18 @@ class SeniorAgent(Agent):
             from .core_adapter import CoreAdapter
             from .specialists.content import ContentSpecialist
         except Exception:
+            self._journal_evidence(
+                "agent_delegation",
+                agent_id="content_specialist",
+                agent_type="specialist",
+                project_name=project_name,
+                args={"route": "content"},
+                execution_state="failed",
+                result_summary=(
+                    "content specialist import failed; "
+                    "skeleton fallback used"
+                ),
+            )
             return None
         try:
             adapter = CoreAdapter(
@@ -470,8 +607,31 @@ class SeniorAgent(Agent):
                 user_request=user_request,
             )
         except Exception:
+            self._journal_evidence(
+                "agent_delegation",
+                agent_id="content_specialist",
+                agent_type="specialist",
+                project_name=project_name,
+                args={"route": "content"},
+                execution_state="failed",
+                result_summary=(
+                    "content delegation failed; skeleton fallback used"
+                ),
+            )
             return None
         if answer is None:
+            self._journal_evidence(
+                "agent_delegation",
+                agent_id="content_specialist",
+                agent_type="specialist",
+                project_name=project_name,
+                args={"route": "content"},
+                execution_state="failed",
+                result_summary=(
+                    "content specialist returned no answer; "
+                    "skeleton fallback used"
+                ),
+            )
             return None
         return answer
 
@@ -542,6 +702,18 @@ class SeniorAgent(Agent):
 
         except PermissionError as e:
             # Agent tried to access a restricted tool
+            self._journal_evidence(
+                "agent_delegation",
+                agent_id=agent_type + "_agent",
+                agent_type="specialist",
+                project_name=project_name,
+                args={"route": agent_type},
+                execution_state="failed",
+                result_summary=(
+                    "delegation denied by permission model; "
+                    "skeleton fallback used"
+                ),
+            )
             return self._analyze_request(
                 task,
                 project_name=project_name,
@@ -553,6 +725,17 @@ class SeniorAgent(Agent):
         except Exception:
             # If delegation fails, fall back to skeleton analysis.
             # Never break the request entirely.
+            self._journal_evidence(
+                "agent_delegation",
+                agent_id=agent_type + "_agent",
+                agent_type="specialist",
+                project_name=project_name,
+                args={"route": agent_type},
+                execution_state="failed",
+                result_summary=(
+                    "delegation failed; skeleton fallback used"
+                ),
+            )
             return self._analyze_request(
                 task,
                 project_name=project_name,

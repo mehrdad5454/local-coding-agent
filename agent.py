@@ -34,7 +34,15 @@ MODEL_URL = "http://127.0.0.1:8080/completion"
 # When False (default), Local Agent behaves exactly as before.
 # When True, requests are routed through SeniorAgent orchestrator
 # instead of the legacy/run_agentic_loop path.
-use_multi_agent = False
+# Phase 7-A: explicit opt-in via the LOCAL_AGENT_MULTI_AGENT env var
+# ("1"/"true"/"yes"/"on"). Unset or any other value keeps the flag
+# False, so the default runtime path is unchanged.
+use_multi_agent = (
+    os.environ.get("LOCAL_AGENT_MULTI_AGENT", "")
+    .strip()
+    .lower()
+    in ("1", "true", "yes", "on")
+)
 
 SENSITIVE_KEYS = (
     "DB_NAME",
@@ -8659,7 +8667,9 @@ def record_multi_write_undo(
     args=None,
     approval_state=ACTION_APPROVAL_APPROVED,
     verified=True,
-    summary="multi-file batch executed"
+    summary="multi-file batch executed",
+    agent_id=None,
+    agent_type=None
 ):
     # ثبت Undo برای Batch موفق. فقط وقتی فراخوانی می‌شود که
     # Write واقعاً موفق بوده باشد؛ Batch ناموفق هرگز اینجا
@@ -8685,6 +8695,8 @@ def record_multi_write_undo(
         execution_state=ACTION_STATE_DONE,
         verify_state=verify_state_from_bool(bool(verified)),
         result_summary=summarize_action_result(summary),
+        agent_id=agent_id,
+        agent_type=agent_type,
     )
 
 
@@ -13923,6 +13935,8 @@ def execute_pending_action(
             args=args,
             approval_state=ACTION_APPROVAL_APPROVED,
             verified=result.get("verified") is not False,
+            agent_id=pending.get("agent_id"),
+            agent_type=pending.get("agent_type"),
         )
 
     entry = {
@@ -14198,7 +14212,9 @@ def handle_agent_batch_proposal(
     allow_write=False,
     stop_event=None,
     correction_attempts=0,
-    proposal_source=None
+    proposal_source=None,
+    agent_id=None,
+    agent_type=None
 ):
     """
     Step 2: run an agent's PROPOSAL through the existing Step 1 batch path.
@@ -14230,6 +14246,12 @@ def handle_agent_batch_proposal(
     every safety layer again: validation, project boundary, write
     permission, approval/autonomous, Emergency Stop, Re-validation,
     atomic write, journal and Verify. A second failure stops execution.
+
+    Phase 7-A addition: agent_id/agent_type are OPTIONAL producer
+    attribution metadata (evidence only). They are copied into the
+    journal and, when provided, into the Pending Action as plain keys
+    that sit OUTSIDE the plan fingerprint (tool/args/project/project_root).
+    No approval, execution or safety decision ever reads them back.
     """
     # تلاش صفر = Proposal اصلی. هر گام اصلاحی از همان ابتدای همین
     # حلقه عبور میکند، پس هیچ Safety Layer ای دور زده نمیشود.
@@ -14332,6 +14354,16 @@ def handle_agent_batch_proposal(
             ),
         }
 
+        # Phase 7-A: producer attribution (evidence only). Added ONLY
+        # when provided, and outside the plan fingerprint, so Pending
+        # Action Identity and Re-validation behave exactly as before
+        # for every existing caller.
+        if agent_id:
+            pending_action["agent_id"] = agent_id
+
+        if agent_type:
+            pending_action["agent_type"] = agent_type
+
         # Manual: ONE approval for the entire batch, exactly like Step 1.
         # A correction is never a shortcut: it enters this same gate.
         if not is_autonomous_project(project_name):
@@ -14426,6 +14458,8 @@ def handle_agent_batch_proposal(
                 "agent batch proposal executed; verify="
                 + ("ok" if verified_ok else "failed")
             ),
+            agent_id=agent_id,
+            agent_type=agent_type,
         )
 
         entry = {
@@ -14711,6 +14745,10 @@ def run_agent(
 
                     if agent_proposal:
                         # A proposal never executes here; the Core does.
+                        # Phase 7-A: carry the producing agent's identity
+                        # (orchestrator / specialist) into the execution
+                        # record as evidence-only metadata.
+                        origin = senior.get_proposal_origin() or (None, None)
                         proposal_result = handle_agent_batch_proposal(
                             agent_proposal,
                             project_name=project_name,
@@ -14718,6 +14756,8 @@ def run_agent(
                             user_request=user_request,
                             allow_write=allow_write,
                             stop_event=stop_event,
+                            agent_id=origin[0],
+                            agent_type=origin[1],
                         )
 
                         remember_conversation_message(
@@ -14740,6 +14780,29 @@ def run_agent(
                     return senior_result
 
                 except Exception:
+                    # Phase 7-A: evidence-only journal record. Control
+                    # flow is unchanged: the exception is not re-raised
+                    # and the legacy fallback below still runs. The
+                    # Safety Spine is untouched; this only makes the
+                    # multi-agent failure observable in the journal.
+                    try:
+                        record_action(
+                            action_type="agent_fallback",
+                            operation_class=ACTION_CLASS_READ,
+                            tool="run_agent",
+                            args={"error": str(sys.exc_info()[1])[:120]},
+                            project=project_name,
+                            project_root=project_root,
+                            agent_id="orchestrator",
+                            agent_type="orchestrator",
+                            execution_state=ACTION_STATE_FAILED,
+                            result_summary=summarize_action_result(
+                                "multi-agent path failed; fell back to "
+                                "agentic_loop/legacy"
+                            ),
+                        )
+                    except Exception:
+                        pass
                     # Phase 7: خطای Multi-Agent دیگر کاملاً بی‌صدا
                     # نیست. رفتار کنترل جریان دقیقاً مثل قبل است:
                     # استثنا دوباره raise نمی‌شود و مسیر fallback

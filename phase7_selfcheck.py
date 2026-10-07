@@ -419,7 +419,13 @@ def section_d_persona_and_routing(agents):
         )
 
     def used_agents():
-        return [entry.get("agent_id") for entry in journal]
+        # Phase 7-A: the journal also holds orchestrator evidence records
+        # (agent_routing). Sub-agent attribution is asserted on the
+        # specialists' own agent_delegation entries only.
+        return [
+            entry.get("agent_id") for entry in journal
+            if entry.get("action_type") == "agent_delegation"
+        ]
 
     marketing_request = agents.MarketingAgent.TRIGGERS[0]
     output = route(marketing_request)
@@ -449,7 +455,10 @@ def section_d_persona_and_routing(agents):
     output = route("hello there, plain request")
     check(
         "unrecognized request -> skeleton analysis, no sub-agent, no LLM",
-        journal == [] and llm_calls == [] and isinstance(output, str) and bool(output),
+        # Phase 7-A: a skeleton agent_routing evidence record is expected;
+        # the original intent is that NO sub-agent ran and NO LLM was called.
+        used_agents() == [] and llm_calls == []
+        and isinstance(output, str) and bool(output),
         str(output)[:120],
     )
 
@@ -812,7 +821,9 @@ def section_d2_integration(agent):
     )
     check_equal(
         "run_agent delegated to MarketingAgent",
-        [entry.get("agent_id") for entry in journal],
+        # Phase 7-A: ignore orchestrator agent_routing evidence records.
+        [entry.get("agent_id") for entry in journal
+         if entry.get("action_type") == "agent_delegation"],
         ["marketing_agent"],
     )
     check_equal(
