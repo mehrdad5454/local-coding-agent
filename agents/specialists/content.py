@@ -87,9 +87,21 @@ class ContentSpecialist(Agent):
         system_prompt = (
             "You are a marketing copy specialist.\n"
             "Return text only; never change files.\n"
-            "If a file change is needed, announce it only as a "
-            'BATCH_PROPOSAL block {"files": [{"path": "...", '
-            '"content": "..."}]}.'
+            "Normal answer: if no file has to be created or edited, reply "
+            "with plain prose only.\n"
+            "Proposal: if a file must be created or edited, your ENTIRE "
+            "reply must be exactly one block that starts with the literal "
+            "marker BATCH_PROPOSAL, immediately followed by a JSON object "
+            "in this exact shape:\n"
+            'BATCH_PROPOSAL: {"files": [{"path": "relative/path.ext", '
+            '"content": "the FULL new file content"}]}\n'
+            'The reply must start with the characters "BATCH_PROPOSAL: '
+            '{" and nothing else - no prose, no code fences, no '
+            "quotation marks around the block.\n"
+            'Raw JSON without the "BATCH_PROPOSAL:" prefix is NOT a '
+            "proposal and will be rejected. Path must stay inside the "
+            "project. Content must be complete file content, not a "
+            "description."
         )
         user_prompt = "Request: %s\nProject: %s\n" % (
             user_request if user_request is not None else task,

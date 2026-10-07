@@ -279,6 +279,19 @@ class SeniorAgent(Agent):
                 user_request=user_request,
             )
 
+        # Phase 6: content-file request -> ContentSpecialist (Analyze->Propose).
+        # Checked AFTER the registered agents so their routing never changes.
+        if self._is_content_file_request(user_request):
+            specialist_result = self._delegate_to_content_specialist(
+                user_request,
+                project_name=project_name,
+                project_root=project_root,
+                allow_write=allow_write,
+                stop_event=stop_event,
+            )
+            if specialist_result is not None:
+                return specialist_result
+
         # Fallback: skeleton analysis for unrecognized requests.
         return self._analyze_request(
             task,
@@ -389,6 +402,78 @@ class SeniorAgent(Agent):
                 return True
 
         return False
+
+    # Phase 6 — First real specialist: content-file requests.
+    #
+    # Narrow on purpose: a request must BOTH ask for file content
+    # (write/create/update a named file) AND be content-flavoured
+    # (landing/marketing/copy/text). This keeps marketing/research/
+    # opportunity routing untouched and gives ContentSpecialist exactly
+    # one real use case: propose a text file for the Core to handle.
+    CONTENT_FILE_HINTS = (
+        ".html", ".md", ".txt",
+        "landing page", "landing-page", "landingpage",
+        "لندینگ",
+    )
+
+    CONTENT_WRITE_HINTS = (
+        "بنویس", "بساز", "ایجاد کن", "تولید کن",
+        "write", "create", "generate", "draft",
+    )
+
+    def _is_content_file_request(self, user_request: str) -> bool:
+        """True only for a content-flavoured file-creation request."""
+        if not user_request:
+            return False
+        lowered = user_request.lower()
+        has_file_hint = any(h in lowered for h in self.CONTENT_FILE_HINTS)
+        has_write_hint = any(h in lowered for h in self.CONTENT_WRITE_HINTS)
+        return bool(has_file_hint and has_write_hint)
+
+    def _delegate_to_content_specialist(
+        self,
+        user_request: str,
+        project_name: str,
+        project_root: str,
+        allow_write: bool,
+        stop_event,
+    ):
+        """Build ContentSpecialist from a CoreAdapter; return answer or None.
+
+        The specialist is constructed ONLY from a CoreAdapter over the
+        already-sanitized tools (never raw callables, never agent.py).
+        It reasons via the model and may return a Proposal-v1 dict.
+        Execution never happens here: the caller (SeniorAgent.propose /
+        run_agent) hands any proposal to the Core's
+        handle_agent_batch_proposal through the normal Safety Spine.
+        Returns None when the specialist cannot run, so the caller
+        falls through to the previous behaviour unchanged.
+        """
+        try:
+            from .core_adapter import CoreAdapter
+            from .specialists.content import ContentSpecialist
+        except Exception:
+            return None
+        try:
+            adapter = CoreAdapter(
+                tools=dict(self.tools),
+                stop_event=stop_event,
+            )
+            specialist = ContentSpecialist(
+                adapter=adapter,
+                stop_event=stop_event,
+            )
+            answer, _proposal = specialist.propose(
+                user_request,
+                project_name=project_name,
+                stop_event=stop_event,
+                user_request=user_request,
+            )
+        except Exception:
+            return None
+        if answer is None:
+            return None
+        return answer
 
     def _delegate_to_subagent(
         self,
