@@ -1567,44 +1567,6 @@ button:hover {
 {% endfor %}
 </select>
 
-<form
-    method="post"
-    action="/add-project"
-    style="display:inline">
-    <input
-        type="hidden"
-        name="{{ csrf_field }}"
-        value="{{ csrf_token }}"
-    >
-    <button
-        type="submit"
-        class="small-button">
-        + افزودن پروژه
-    </button>
-</form>
-
-{% if project_name != "agent-test" and project_name != "general" %}
-<form
-    method="post"
-    action="/remove-project"
-    style="display:inline">
-    <input
-        type="hidden"
-        name="{{ csrf_field }}"
-        value="{{ csrf_token }}"
-    >
-    <input
-        type="hidden"
-        name="name"
-        value="{{ project_name | e }}">
-    <button
-        type="submit"
-        class="small-button remove-button">
-        حذف
-    </button>
-</form>
-{% endif %}
-
 </div>
 
 <div class="mode-box">
@@ -1663,6 +1625,48 @@ button:hover {
 </button>
 
 </form>
+
+<div class="project-actions" style="margin-top: 10px;">
+
+<form
+    method="post"
+    action="/add-project"
+    style="display:inline">
+    <input
+        type="hidden"
+        name="{{ csrf_field }}"
+        value="{{ csrf_token }}"
+    >
+    <button
+        type="submit"
+        class="small-button">
+        + افزودن پروژه
+    </button>
+</form>
+
+{% if project_name != "agent-test" and project_name != "general" %}
+<form
+    method="post"
+    action="/remove-project"
+    style="display:inline">
+    <input
+        type="hidden"
+        name="{{ csrf_field }}"
+        value="{{ csrf_token }}"
+    >
+    <input
+        type="hidden"
+        name="name"
+        value="{{ project_name | e }}">
+    <button
+        type="submit"
+        class="small-button remove-button">
+        حذف
+    </button>
+</form>
+{% endif %}
+
+</div>
 
 {% if running %}
 <div class="status">

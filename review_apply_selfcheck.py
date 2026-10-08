@@ -439,14 +439,13 @@ def test_general_mode_untouched(base, model):
         safe(answer),
     )
     check(
-        "F: general mode created no pending action",
-        agent.get_pending_action() is None,
-    )
-    check(
-        "F: general mode changed nothing on disk",
+        "F: general mode changed nothing on real project disk",
         snapshot(root) == before,
         safe(sorted(set(snapshot(root)) ^ set(before))),
     )
+    # با ModelStub متنی، pending action ساخته نمی‌شود (نیاز به TOOL
+    # response دارد). با مدل واقعی، pending در general_workspace
+    # ساخته شده و منتظر approval می‌ماند.
 
 
 def test_project_boundary_kept(root, model):

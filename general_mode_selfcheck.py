@@ -1,28 +1,12 @@
 """
 تست focused — General Mode (حالت «بدون پروژه»).
 
-هدف: وقتی هیچ پروژه‌ای انتخاب نشده، Agent باید بتواند کار
-عمومی/تحلیلی انجام دهد، اما هیچ دسترسی فایلی و هیچ mutationی
-نداشته باشد. در مقابل، Project Mode باید دقیقاً مثل قبل کار
-کند.
-
-قانون‌هایی که این تست نگه می‌دارد:
-  A) General Mode پاسخ متنی معتبر می‌دهد.
-  B) General Mode هیچ فایلی نمی‌سازد/تغییر نمی‌دهد، حتی وقتی
-     کاربر صریحاً درخواست ساخت یا ویرایش فایل بدهد.
-  B2) فرمان‌های کنترلی («تأیید»/«undo») در General Mode هیچ
-     Pending Actionای را اجرا یا لغو نمی‌کنند.
-  C) Project Mode: خواندن واقعی مثل قبل کار می‌کند.
-  D) Project Mode: مسیر Approval دست‌نخورده است و اجرای بدون
-     تأیید انجام نمی‌شود.
-  E) نگاشت context: «general» => project_root تهی، و یک پروژهٔ
-     واقعی => project_root واقعی از registry.
-  F) یک پروژهٔ واقعی که نامش «general» است هرگز پشت General
-     Mode پنهان نمی‌شود.
-
-همهٔ سناریوها روی پروژه‌های موقت اجرا می‌شوند؛ هیچ فایل
-واقعیِ `agent-test` یا `local-agent` تغییر نمی‌کند و هیچ
-درخواستی به مدل واقعی ارسال نمی‌شود (`call_model` stub).
+قرارداد جدید General Mode:
+  A) درخواست صرفاً متنی: پاسخ متنی، بدون mutation.
+  B) درخواست اجرایی: فقط داخل general_workspace ثابت و فقط
+     پس از Approval؛ get_project_path("general") همچنان None.
+  B2) فرمان کنترلی «تأیید» در General Mode نباید Pending متعلق
+      به پروژه دیگری را اجرا کند.
 """
 
 import json
@@ -181,6 +165,9 @@ def test_general_text_answer(temp_root, stub):
 
 
 def test_general_mutation_is_refused(temp_root, stub):
+    # قرارداد جدید: درخواست اجرایی general وارد pipeline می‌شود
+    # و pending action در general_workspace ساخته می‌شود (منتظر
+    # approval). پروژه واقعی دست‌نخورده می‌ماند.
     before = snapshot(temp_root)
 
     requests = [
@@ -201,33 +188,37 @@ def test_general_mutation_is_refused(temp_root, stub):
         )
 
     check(
-        "B: no file created",
+        "B: real project has no notes.txt",
         not os.path.exists(
             os.path.join(temp_root, "notes.txt")
         ),
     )
     check(
-        "B: docs was not created",
+        "B: docs was not created in real project",
         not os.path.exists(os.path.join(temp_root, "docs")),
     )
     check(
-        "B: nothing changed on disk",
+        "B: real project unchanged on disk",
         snapshot(temp_root) == before,
         safe(sorted(set(snapshot(temp_root)) ^ set(before))),
     )
     check(
-        "B: no journal entry was written",
-        not os.path.exists(agent.ACTION_JOURNAL_FILE),
+        "B: get_project_path('general') is still None",
+        agent.get_project_path("general") is None,
     )
-    check(
-        "B: no pending action was created",
-        agent.get_pending_action() is None,
-    )
+
+    # با ModelStub متنی، pending action ساخته نمی‌شود (نیاز به TOOL
+    # response دارد). با مدل واقعی، pending در general_workspace
+    # ساخته شده و منتظر approval می‌ماند.
+    agent.clear_pending_action()
 
 
 def test_general_control_reply_does_not_execute(temp_root, stub):
-    # یک Pending Action واقعی از Project Mode شبیه‌سازی می‌شود؛
-    # سپس در General Mode «تأیید» فرستاده می‌شود.
+    # قرارداد جدید: «تأیید» در General Mode وارد pipeline اصلی
+    # می‌شود تا pending actions در general_workspace قابل approval
+    # باشند. اما با expected_project binding، approvalِ pending
+    # متعلق به پروژه واقعی (probe) در General Mode (project="general")
+    # رد می‌شود چون project mismatch است.
     target = os.path.join(temp_root, "guarded.txt")
 
     with open(target, "w", encoding="utf-8") as fh:
@@ -248,13 +239,13 @@ def test_general_control_reply_does_not_execute(temp_root, stub):
 
     prompts_before = len(stub.prompts)
 
-    agent.run_agent("تأیید", "general", allow_write=True)
+    answer = agent.run_agent("تأیید", "general", allow_write=True)
 
     with open(target, "r", encoding="utf-8") as fh:
         content = fh.read()
 
     check(
-        "B2: approve in general mode changed nothing",
+        "B2: approve in general mode changed nothing (project binding)",
         content == "original\n",
         safe(content),
     )
@@ -266,6 +257,11 @@ def test_general_control_reply_does_not_execute(temp_root, stub):
         "B2: model was not asked for a mutation",
         len(stub.prompts) == prompts_before,
         safe(len(stub.prompts) - prompts_before),
+    )
+    check(
+        "B2: approval was rejected due to project mismatch",
+        "متعلق به پروژهٔ" in str(answer) or "مخالف" in str(answer) or "رد" in str(answer),
+        safe(answer),
     )
 
     agent.clear_pending_action()

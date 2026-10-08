@@ -24,6 +24,14 @@ except Exception:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_FILE = os.path.join(BASE_DIR, "projects.json")
 
+# General Mode executable workspace (fixed, isolated sandbox).
+#
+# Text-only requests keep the old behavior. Executive requests in
+# General Mode run inside this directory only, through the same
+# Safety Pipeline as normal projects. The path is constant and is
+# never taken from user input.
+GENERAL_WORKSPACE_DIR = os.path.join(BASE_DIR, "general_workspace")
+
 DEFAULT_PROJECTS = {
     "agent-test": r"D:\AI\agent-test"
 }
@@ -402,6 +410,33 @@ def is_general_mode(project_name):
         return False
 
     return get_project_path(project_name) is None
+
+
+def ensure_general_workspace():
+    # Lazy creation of the fixed General Mode sandbox.
+    #
+    # Only called when an executive request really needs a root.
+    # Fail-Closed: existing non-directory, symlink replacement or
+    # creation failure returns None and the request must stop.
+    # No fallback to any other path is allowed.
+    target = os.path.abspath(GENERAL_WORKSPACE_DIR)
+    base = os.path.abspath(BASE_DIR)
+
+    if os.path.commonpath([target, base]) != base:
+        return None
+
+    try:
+        if os.path.lexists(target) and not os.path.isdir(target):
+            return None
+
+        os.makedirs(target, exist_ok=True)
+
+        if not os.path.isdir(target):
+            return None
+
+        return target
+    except Exception:
+        return None
 
 
 def run_general_task(
@@ -14577,29 +14612,81 @@ def run_agent(
         "user", user_request, project_name
     )
 
-    # General Mode قبل از هر مسیر دیگری:
-    # نه Approval، نه Undo، نه Agentic Loop و نه Legacy
-    # در این حالت اجرا نمی‌شوند. پروژهٔ انتخاب‌شده همچنان
-    # دقیقاً مثل قبل از همین خط عبور می‌کند.
+    # General Mode:
+    # - درخواست صرفاً متنی -> همان run_general_task() قبلی.
+    # - درخواست اجرایی (طبق should_use_agentic_loop) -> همان
+    #   pipeline پروژه عادی ولی با ریشه ثابت GENERAL_WORKSPACE_DIR.
+    # get_project_path دست‌نخورده است و برای general همچنان None
+    # برمی‌گرداند؛ general هرگز وارد projects.json نمی‌شود و هیچ
+    # مسیری از ورودی کاربر گرفته نمی‌شود.
     if is_general_mode(project_name):
-        general_result = run_general_task(
-            user_request,
-            project_name=project_name,
-            allow_write=allow_write,
-            stop_event=stop_event,
-            progress=progress,
-        )
+        general_effective_root = None
 
-        remember_conversation_message(
-            "agent", general_result, project_name
-        )
+        try:
+            general_effective_root = GENERAL_WORKSPACE_DIR
+        except Exception:
+            general_effective_root = None
 
-        # Phase 4 — Durable Memory record (flag-gated, never fails).
-        _record_durable_interaction(
-            user_request, general_result, project_name=project_name
-        )
+        general_is_executive = False
 
-        return general_result
+        try:
+            general_is_executive = bool(should_use_agentic_loop(
+                user_request, general_effective_root
+            ))
+        except Exception:
+            general_is_executive = False
+
+        general_is_control = False
+        try:
+            general_is_control = detect_control_reply(user_request) is not None
+        except Exception:
+            general_is_control = False
+
+        if not general_is_executive and not general_is_control:
+            general_result = run_general_task(
+                user_request,
+                project_name=project_name,
+                allow_write=allow_write,
+                stop_event=stop_event,
+                progress=progress,
+            )
+
+            remember_conversation_message(
+                "agent", general_result, project_name
+            )
+
+            # Phase 4 — Durable Memory record (flag-gated, never fails).
+            _record_durable_interaction(
+                user_request, general_result, project_name=project_name
+            )
+
+            return general_result
+
+        general_root = ensure_general_workspace()
+
+        if not general_root or not os.path.isdir(general_root):
+            general_fail = build_report(
+                "General Mode",
+                GENERAL_MODE_NAME,
+                None,
+                [
+                    "Workspace اختصاصی General در دسترس نیست؛ "
+                    "هیچ تغییری انجام نشد.",
+                ],
+            )
+
+            remember_conversation_message(
+                "agent", general_fail, project_name
+            )
+
+            return general_fail
+
+        # پروژه انتخاب‌شده همچنان دقیقاً مثل قبل از همین خط عبور
+        # می‌کند؛ فقط general اجرایی با effective_root ثابت ادامه
+        # می‌دهد تا Proposal → Approval → Re-validation → Execute
+        # → Verify → Journal طی شود. هیچ pipeline جدیدی ساخته
+        # نمی‌شود.
+        project_root = general_root
 
     if project_root and os.path.isdir(project_root):
         try:
@@ -14631,7 +14718,8 @@ def run_agent(
             approval_result = handle_pending_action_request(
                 user_request,
                 allow_write=allow_write,
-                stop_event=stop_event
+                stop_event=stop_event,
+                expected_project=project_name
             )
 
             if approval_result is not None:

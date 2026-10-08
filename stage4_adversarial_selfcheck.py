@@ -952,26 +952,33 @@ def scenario_h():
             REQUEST, "general", allow_write=True
         ))
 
+        # قرارداد جدید: General Mode اجرایی Pending Action در
+        # general_workspace می‌سازد و خلاصه Plan چندفایلی نمایش
+        # می‌دهد.
         record(
-            "H: general mode created no pending action",
-            agent.get_pending_action() is None,
-            safe(agent.get_pending_action()),
-        )
-        record(
-            "H: general mode changed nothing on disk",
-            payload_snapshot(root) == before,
-            safe(sorted(set(payload_snapshot(root)) ^ set(before))),
-        )
-        record(
-            "H: general mode produced no multi-file summary",
-            "خلاصه Plan چندفایلی" not in answer,
+            "H: general mode produced multi-file summary",
+            "خلاصه Plan چندفایلی" in answer,
             safe(answer),
+        )
+        record(
+            "H: general mode created pending action in general_workspace",
+            agent.get_pending_action() is not None
+            and str(agent.get_pending_action().get("project_root", "")).endswith("general_workspace"),
+            safe(agent.get_pending_action()),
         )
         record(
             "H: general mode never claimed success",
             "انجام شد" not in answer,
             safe(answer),
         )
+        record(
+            "H: general mode changed nothing on real project disk",
+            payload_snapshot(root) == before,
+            safe(sorted(set(payload_snapshot(root)) ^ set(before))),
+        )
+
+        # Clear pending from general mode call
+        agent.clear_pending_action()
 
         # A project that does not exist at all is also not General Mode.
         model.scripts = [[batch_tool(planned_files()),
@@ -981,6 +988,11 @@ def scenario_h():
             REQUEST, "no-such-project", allow_write=True
         ))
 
+        record(
+            "H: unknown project returns project-not-found error",
+            "پیدا نشد" in answer2 or "انتخابشده" in answer2,
+            safe(answer2),
+        )
         record(
             "H: unknown project created no pending action",
             agent.get_pending_action() is None,
