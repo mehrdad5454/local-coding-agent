@@ -10828,6 +10828,139 @@ def request_status_map(
     }
 
 
+def build_completion_gate_input(
+    project_root, user_request, transcript, known_request_status=None
+):
+    # Phase 3 — ورودی ساختاریافتهٔ دروازه تکمیل از داده‌های واقعی.
+    #
+    # الزامات فقط وقتی ساخته می‌شوند که قطعی باشند: همان فایل‌هایی
+    # که find_requested_files واقعاً از متن درخواست استخراج کرده
+    # (بدون حدس). اگر درخواست الزام‌های دیگری (غیرفایلی) هم داشته
+    # باشد، این ورودی آن‌ها را نمی‌سنجد؛ بنابراین نتیجه Gate هرگز
+    # دلیلِ «کامل بودن کل درخواست» نمی‌شود و فقط برای همین فایل‌های
+    # مشخص شواهد سنجیده می‌شوند.
+    #
+    # شواهد فقط از نتایج واقعی ابزار ساخته می‌شوند:
+    # - mutating entry با verified True و result.ok != False → success
+    # - verified False یا result.ok False → failure
+    # - بدون Verify معتبر → هیچ شاهدی (هرگز success)
+    # ادعای FINAL مدل اینجا اصلاً دیده نمی‌شود؛ فقط به‌صورت
+    # final_claim در فراخوانی پایین‌تر ثبت می‌شود.
+    if not request_asks_for_mutation(user_request):
+        return [], []
+
+    requirements = []
+    seen = set()
+
+    for item in find_requested_files(project_root, user_request):
+        path = normalize_relative_target(item.get("relative_path"))
+
+        if path and path not in seen:
+            seen.add(path)
+            requirements.append({"id": path, "text": path})
+
+    if not requirements:
+        return [], []
+
+    evidence = []
+
+    # known_request_status فقط برای همان درخواست و همان الزام
+    # معتبر است: کلیدها همان relative_pathهای نرمال‌شدهٔ همین
+    # درخواست‌اند که در چرخهٔ Approval قبلیِ همین درخواست ساخته
+    # شده‌اند (request_status_map). کلیدهای بیرون از مجموعه
+    # الزام‌های فعلی نادیده گرفته می‌شوند.
+    if isinstance(known_request_status, dict):
+
+        for path, state in known_request_status.items():
+            key = normalize_relative_target(path)
+
+            if key not in seen:
+                continue
+
+            if state == "verified":
+                evidence.append({"requirement": key, "outcome": "success"})
+            elif state == "failed":
+                evidence.append({"requirement": key, "outcome": "failure"})
+
+    for entry in transcript or []:
+        if not isinstance(entry, dict) or not entry.get("mutating"):
+            continue
+
+        result = entry.get("result")
+        result = result if isinstance(result, dict) else {}
+        verified = entry.get("verified")
+
+        if verified is True and result.get("ok") is not False:
+            outcome = "success"
+        elif verified is False or result.get("ok") is False:
+            outcome = "failure"
+        else:
+            # Mutation بدون Verify معتبر: نه موفقیت است و نه شکست
+            # قطعی؛ Gate آن را «بدون شاهد» می‌سنجد.
+            outcome = None
+
+        if outcome is None:
+            continue
+
+        for path in mutation_targets_of_entry(entry):
+            if path in seen:
+                evidence.append({"requirement": path, "outcome": outcome})
+
+    return requirements, evidence
+
+
+def evaluate_completion_gate(
+    project_root, user_request, transcript,
+    known_request_status=None, final_claim=False
+):
+    # فراخوانی امنِ دروازه تکمیل: هیچ خطای import یا اجرایی نباید
+    # حلقه را بشکند؛ در شکست، None برمی‌گردد و رفتار قبلیِ حلقه
+    # بدون تغییر ادامه می‌یابد (Fail-Open به رفتار موجود، نه به
+    # ادعای تکمیل).
+    try:
+        from agents.completion_gate import evaluate_completion
+
+    except Exception as gate_error:
+        try:
+            print(
+                "[completion-gate] import failed: %r" % (gate_error,),
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+        return None
+
+    try:
+        requirements, evidence = build_completion_gate_input(
+            project_root, user_request, transcript,
+            known_request_status=known_request_status
+        )
+
+        # Gate فقط برای درخواست‌هایی فعال می‌شود که الزاماتشان به‌صورت
+        # قطعی استخراج شده باشد؛ وگرنه خاموش است تا رفتار
+        # تحلیلی/بدون‌نام‌فایل عوض نشود و هیچ ادعای تکمیلی ساخته نشود.
+        if not requirements:
+            return None
+
+        return evaluate_completion(
+            requirements=requirements,
+            evidence=evidence,
+            final_claim=bool(final_claim),
+        )
+
+    except Exception as gate_error:
+        try:
+            print(
+                "[completion-gate] evaluation failed: %r" % (gate_error,),
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+        return None
+
+
 def result_was_unsuccessful(result):
     # آیا نتیجهٔ یک ابزارِ غیرmutating «بی‌نتیجه» بوده؟
     # (خطا، متن خالی، یا جستجویی با hits صفر)
@@ -11841,11 +11974,63 @@ def build_loop_report(
                     )
                 )
 
+    # شواهد اجرای فعلی: فقط عملیاتی که در همین transcript با
+    # نتیجهٔ موفق ثبت شده‌اند. این بلوک تفکیکِ متن آزاد مدل از
+    # واقعیت اجراست: ادعای «بررسی شد» بدون آمدن در این فهرست
+    # تأییدنشده محسوب می‌شود و خواندنِ فایل هم به‌تنهایی دالّ
+    # بر بررسی کامل یا Verify نیست.
+    executed_reads = []
+    seen_read_keys = set()
+
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+
+        if str(entry.get("tool") or "") not in (
+            "read_file", "read_files"
+        ):
+            continue
+
+        values = read_paths_already_seen([entry])
+
+        if not values:
+            continue
+
+        result = entry.get("result")
+
+        if isinstance(result, dict) and result.get("ok") is False:
+            continue
+
+        for value in values:
+            key = normalize_relative_target(value)
+
+            if key and key not in seen_read_keys:
+                seen_read_keys.add(key)
+                executed_reads.append(str(value))
+
+    lines.append("")
+    lines.append(
+        "شواهد اجرای فعلی — فایل‌های واقعاً خوانده‌شده در همین "
+        "گام‌ها (خواندن، به‌تنهایی دالّ بر بررسی کامل یا Verify "
+        "نیست):"
+    )
+
+    if executed_reads:
+        for path in executed_reads:
+            lines.append("- " + path)
+    else:
+        lines.append("- هیچ فایلی در اجرای فعلی خوانده نشد.")
+
     if final_answer:
         lines.append("")
         lines.append("پاسخ نهایی:")
         lines.append(
             clip_text(final_answer, MAX_FINAL_ANSWER_CHARS)
+        )
+        lines.append(
+            "توجه: این متن خروجی مدل است؛ فقط موارد ثبت‌شده در "
+            "«مراحل» و «شواهد اجرای فعلی» بالا واقعیتِ اجرای همین "
+            "گام‌ها هستند."
         )
 
     # وضعیت واقعی فایل‌های درخواستی.
@@ -11872,7 +12057,7 @@ def build_loop_report(
         status_labels = {
             "verified": "تغییر اعمال و Verify موفق",
             "failed": "تغییر اعمال نشد (شکست خورد)",
-            "not changed": "بدون تغییر",
+            "not changed": "بدون تغییر (بدون Verify)",
         }
 
         for item in request_status:
@@ -11891,10 +12076,6 @@ def build_loop_report(
                 "هشدار: درخواست کامل انجام نشد. فایل‌های نام‌برده "
                 "که تغییر و Verify نشدند: "
                 + "، ".join(pending_targets)
-            )
-            lines.append(
-                "عبارت «پاسخ نهایی» بالا فقط متن مدل است؛ مبنای "
-                "این گزارش، عملیات واقعاً اجراشده است."
             )
 
     if pending_plan:
@@ -12426,15 +12607,32 @@ def read_paths_already_seen(transcript):
 
         args = entry.get("args") or {}
 
-        for key in ("path", "relative_path", "dir", "file"):
+        # aliasهای واقعیِ پذیرفته‌شده در tool_read_file:
+        # path / relative_path / file / filename / name
+        # (dir برای سازگاری با کدهای قبلی نگه داشته می‌شود.)
+        for key in (
+            "path", "relative_path", "dir", "file",
+            "filename", "name"
+        ):
             value = args.get(key)
 
             if isinstance(value, str) and value:
                 seen.add(value.replace("\\", "/").strip("/"))
 
-        for value in args.get("paths") or []:
+        # tool_read_files هم «paths» می‌پذیرد هم «files» و هر دو
+        # ممکن است رشتهٔ تک‌مسیر یا لیست رشته باشند.
+        for key in ("paths", "files"):
+            value = args.get(key)
+
             if isinstance(value, str) and value:
                 seen.add(value.replace("\\", "/").strip("/"))
+
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item:
+                        seen.add(
+                            item.replace("\\", "/").strip("/")
+                        )
 
     return seen
 
@@ -12456,6 +12654,192 @@ def normalize_known_read_paths(known_read_paths):
             normalized.add(item)
 
     return normalized
+
+
+# حداکثر تعداد مسیرهای شواهدِ خوانده‌نشده که در یک یادآوریِ
+# واحد به مدل نشان داده می‌شوند. این سقف فقط اندازهٔ همان
+# یادآوری را کوتاه نگه می‌دارد؛ خودِ دروازه در هر بار FINAL از
+# نو محاسبه می‌شود و به یک فایل ثابتِ از پیش تعیین‌شده وابسته
+# نیست.
+MAX_EVIDENCE_PATHS_PER_NUDGE = 4
+
+
+def _evidence_path_matches_request(normalized_path, mentioned):
+    # ارتباط «روشن» یعنی نام فایلی که در متن درخواست آمده با
+    # مسیر اولویت‌دار یکی باشد: همان مسیر دقیق، یا پسوندِ مسیر
+    # وقتی درخواست مسیر نسبی داده، یا basename وقتی درخواست
+    # فقط نام فایل را بدون مسیر برده است.
+    for candidate in mentioned:
+        if not candidate:
+            continue
+
+        if normalized_path == candidate:
+            return True
+
+        if "/" in candidate:
+            if normalized_path.endswith("/" + candidate):
+                return True
+
+        elif normalized_path.rsplit("/", 1)[-1] == candidate:
+            return True
+
+    return False
+
+
+def pending_evidence_paths(
+    project_root, transcript, known_read_paths=None, is_wordpress=None,
+    user_request=None
+):
+    # مسیرهای شواهدی که هنوز واقعاً خوانده نشده‌اند، به ترتیب
+    # اولویت: اول فایل‌های دارای سیگنال ناهنجاری، بعد فایل‌های
+    # ساختاریِ کوتاه‌شده.
+    #
+    # این لیست در هر بار پذیرش FINAL دوباره ساخته می‌شود تا پس
+    # از بررسیِ یک مسیر، مسیر مرتبطِ بعدی انتخاب شود؛ نه اینکه
+    # کل حلقه روی یک فایل ثابت قفل بماند.
+    #
+    # قاعده کاملاً عمومی است: نه نام پروژه، نه مسیر خاص و نه نوع
+    # درخواست در آن ثابت است و هیچ ابزار یا بررسی خاصی را برای
+    # همهٔ درخواست‌ها اجباری نمی‌کند.
+    #
+    # الزام فقط برای مسیرهایی است که ارتباط روشن با متن درخواست
+    # داشته باشند (نام فایلِ صریح). shortlist ساختاری صرفاً به
+    # خاطر خوانده‌نشدن، FINAL را معطل یک گام اضافه نمی‌کند.
+    if not project_root:
+        return []
+
+    # نام فایل‌های صریحِ درخواست؛ بدون آن هیچ مسیری الزام‌آور
+    # نیست و اسکن پروژه هم لازم نیست.
+    mentioned = [
+        normalize_relative_target(item)
+        for item in extract_file_candidates(user_request)
+    ]
+    mentioned = [item for item in mentioned if item]
+
+    if not mentioned:
+        return []
+
+    try:
+        if is_wordpress is None:
+            is_wordpress = is_wordpress_project_root(project_root)
+
+        shortlist, signals = collect_review_priority(
+            project_root, is_wordpress
+        )
+
+    except Exception:
+        return []
+
+    already_read = {
+        normalize_relative_target(item)
+        for item in read_paths_already_seen(transcript)
+    }
+    already_read |= normalize_known_read_paths(known_read_paths)
+
+    pending = []
+
+    for _score, relative, _reasons in list(signals) + list(shortlist):
+        # فایل حساس هرگز در نقشهٔ شواهد نمی‌آید تا دروازه، مدل
+        # را به خواندن رمز/کلید تشویق نکند.
+        if _review_is_sensitive(os.path.basename(relative)):
+            continue
+
+        normalized = normalize_relative_target(relative)
+
+        if not normalized or normalized in already_read:
+            continue
+
+        if not _evidence_path_matches_request(
+            normalized, mentioned
+        ):
+            continue
+
+        already_read.add(normalized)
+        pending.append(relative)
+
+        if len(pending) >= MAX_EVIDENCE_PATHS_PER_NUDGE:
+            break
+
+    return pending
+
+
+def successful_read_paths(transcript, known_read_paths=None):
+    # مسیرهای نرمال‌شده‌ای که واقعاً با read موفق خوانده شده‌اند؛
+    # هم از همین transcript و هم از سابقهٔ منتقل‌شدهٔ همین
+    # درخواست. خواندنِ ناموفق (فایل ناموجود یا حساس) هرگز شمرده
+    # نمی‌شود.
+    paths = set(normalize_known_read_paths(known_read_paths))
+
+    for entry in transcript or []:
+        if not isinstance(entry, dict):
+            continue
+
+        if str(entry.get("tool") or "") not in (
+            "read_file", "read_files"
+        ):
+            continue
+
+        values = read_paths_already_seen([entry])
+
+        if not values:
+            continue
+
+        result = entry.get("result")
+
+        if isinstance(result, dict) and result.get("ok") is False:
+            continue
+
+        for value in values:
+            normalized = normalize_relative_target(value)
+
+            if normalized:
+                paths.add(normalized)
+
+    return paths
+
+
+def content_evidence_status(read_paths, user_request):
+    # وضعیت شواهد محتوا برای درخواست فقط‌خواندنی/تحلیلی:
+    #
+    # "ok"           → دست‌کم یک خواندنِ موفق با هدف درخواست
+    #                  (نام فایلِ صریح) ارتباط روشن دارد.
+    # "missing"      → هیچ خواندن موفقی نیست یا خوانده‌شده‌ها به
+    #                  هدف درخواست ربط روشنی ندارند؛ یادآوریِ
+    #                  موجود (سقف‌دار) فعال می‌شود.
+    # "unverifiable" → درخواست نام فایل ندارد و ارتباط شواهد با
+    #                  هدف قابل راستی‌آزمایی نیست؛ فقط محدودیت
+    #                  صریح در گزارش می‌آید، بدون اجبار به خواندنِ
+    #                  فایل نامرتبط.
+    # "blocked"      → همهٔ نام‌های صریحِ درخواست حساس‌اند و
+    #                  ابزار می‌پذیرد نخواند؛ محدودیت امنیتی
+    #                  اعلام می‌شود، نه کوتاهی مدل.
+    #
+    # فهرست فایل‌ها، درخت پروژه یا نمای کلیِ عمومی هم شواهد
+    # محتوا نیست و به‌تنهایی درخواستِ فقط‌خواندنی را کامل نمی‌کند.
+    mentioned = []
+
+    for item in extract_file_candidates(user_request):
+        normalized = normalize_relative_target(item)
+
+        if normalized and normalized not in mentioned:
+            mentioned.append(normalized)
+
+    if mentioned and all(
+        is_sensitive_read_target(item) for item in mentioned
+    ):
+        return "blocked"
+
+    if not read_paths:
+        return "missing"
+
+    if not mentioned:
+        return "unverifiable"
+
+    for path in read_paths:
+        if _evidence_path_matches_request(path, mentioned):
+            return "ok"
+
+    return "missing"
 
 
 def ensure_edit_file_proposal_is_grounded(
@@ -13069,7 +13453,6 @@ def run_loop_steps(
     # نمی‌کند، پس برای جلوگیری از چرخش بی‌نهایت سقف جداگانه
     # و کوچک دارد.
     invalid_tool_retries = 0
-    pending_evidence_path = top_priority_signal_path(project_root)
 
     while steps_used < max_steps:
         # Phase C: Emergency Stop قبل از شروع Step بعدی.
@@ -13170,35 +13553,166 @@ def run_loop_steps(
         )
 
         if not tool_name:
-            # دروازه شواهد: مدل نباید قبل از خواندن فایلی که
-            # بالاترین سیگنال را دارد، FINAL بنویسد. در تست واقعی
-            # مدل بعد از ۲ گام یک گزارش بی‌ربط درباره robots.txt
-            # نوشت، در حالی که هرگز فایل مشکوک را نخوانده بود.
+            # دروازهٔ شواهد (عمومی): پیش از پذیرش FINAL کفایت
+            # شواهد برای «همین درخواست» سنجیده می‌شود، نه فقط برای
+            # یک فایل ثابتِ از پیش تعیین‌شده. در تست واقعی مدل بعد
+            # از ۲ گام یک گزارش بی‌ربط نوشت، در حالی که هرگز فایل
+            # مشکوک را نخوانده بود.
+            #
+            # مسیرها در همین لحظه از نو ساخته می‌شوند؛ بنابراین
+            # پس از بررسیِ یک مسیر، مسیر مرتبطِ بعدی انتخاب می‌شود
+            # و فایل حساس هرگز در این لیست نمی‌آید. فقط مسیرِ
+            # دارای ارتباط روشن با متن درخواست الزام‌آور است.
+            missing_paths = pending_evidence_paths(
+                project_root, transcript, known_read_paths,
+                user_request=user_request
+            )
+
+            # معیار شواهد متناسب با نوع درخواست: در حالت
+            # فقط‌خواندنی، صرف موفقیتِ یک read_file کافی نیست؛
+            # مسیرهای خوانده‌شده باید با هدف درخواست (نام فایل‌های
+            # صریح) ارتباط روشن داشته باشند. اگر درخواست نام فایل
+            # نداشته باشد، ارتباط قابل راستی‌آزمایی نیست (محدودیت
+            # صریح در گزارش) و اگر نام‌ها همه حساس باشند، محدودیت
+            # امنیتی اعلام می‌شود؛ در هیچ حالتی به خواندنِ فایل
+            # نامرتبط اجبار نمی‌شوود. در حالت تغییر، گیت تکمیلِ
+            # پایین‌تر معیار پایان است.
+            content_reads = set()
+            content_status = "ok"
+
+            if (
+                not is_write_allowed(allow_write)
+                and bool(project_root)
+                and os.path.isdir(project_root)
+            ):
+                content_reads = successful_read_paths(
+                    transcript, known_read_paths
+                )
+                content_status = content_evidence_status(
+                    content_reads, user_request
+                )
+
+            missing_content = content_status == "missing"
+
             if (
                 not last_step
                 and evidence_nudges < MAX_EVIDENCE_NUDGES
                 and steps_used < max_steps
+                and (missing_paths or missing_content)
             ):
-                pending = pending_evidence_path
+                evidence_nudges += 1
+                nudge_parts = []
 
-                if (
-                    pending
-                    and pending not in read_paths_already_seen(
-                        transcript
+                if missing_paths:
+                    nudge_parts.append(
+                        "این مسیرهای اولویت‌دار هنوز خوانده "
+                        "نشده‌اند: "
+                        + "، ".join(missing_paths)
+                        + ". اول read_file روی اولین مسیر بزن و "
+                        "اگر برای پاسخ لازم بود، مسیرهای بعدی "
+                        "را هم بررسی کن."
                     )
-                ):
-                    evidence_nudges += 1
-                    observations.append(
-                        "شواهد کافی جمع نشده است: فایل "
-                        + pending
-                        + " بیشترین سیگنال ناهنجاری را دارد و "
-                        "هنوز خوانده نشده. همین حالا با read_file "
-                        "همان مسیر را بخوان، خطوط سیگنال را بررسی "
-                        "کن و بعد FINAL بنویس. اگر پس از خواندن "
-                        "مطمئن شدی مثبت کاذب است، در FINAL صریح "
-                        "بگو چرا."
+
+                if missing_content:
+                    if content_reads:
+                        nudge_parts.append(
+                            "این مسیرها خوانده شده‌اند ولی با هدف "
+                            "درخواست ارتباط روشنی ندارند: "
+                            + "، ".join(
+                                sorted(content_reads)[
+                                    :MAX_EVIDENCE_PATHS_PER_NUDGE
+                                ]
+                            )
+                            + ". اکنون محتوای یک فایل واقعاً "
+                            "مرتبط با درخواست را با read_file "
+                            "بخوان و چیزی را که فقط از محتوا "
+                            "قابل فهم است در FINAL بیاور."
+                        )
+                    else:
+                        nudge_parts.append(
+                            "هنوز محتوای هیچ فایل واقعیِ پروژه را "
+                            "نخوانده‌ای؛ فهرست فایل‌ها یا نمای کلی "
+                            "پروژه به‌تنهایی شواهد کافی نیست. با "
+                            "read_file محتوای یک فایل مرتبط با "
+                            "درخواست را بخوان و چیزی را که فقط از "
+                            "محتوا قابل فهم است در FINAL بیاور."
+                        )
+
+                    mentioned_now = extract_file_candidates(
+                        user_request
                     )
-                    continue
+
+                    if mentioned_now:
+                        nudge_parts.append(
+                            "فایل‌های نام‌برده در درخواست: "
+                            + "، ".join(
+                                mentioned_now[
+                                    :MAX_EVIDENCE_PATHS_PER_NUDGE
+                                ]
+                            )
+                            + " را حتماً بخوان."
+                        )
+
+                observations.append(
+                    "شواهد کافی جمع نشده است: "
+                    + " ".join(nudge_parts)
+                    + " اگر پس از خواندن مطمئن شدی مثبت کاذب "
+                    "است یا ابزار/دسترسی لازم را نداری، در FINAL "
+                    "صریح بگو چرا."
+                )
+                continue
+
+            # اگر ادامه ممکن نیست (سقف یادآوری یا سقف گام پر
+            # شده) ولی شواهد همچنان ناکافی است، پذیرش FINAL باید
+            # شفاف گزارش شود؛ وگرنه گزارش دربارهٔ کامل بودن
+            # درخواست سکوت می‌کند و کاربر چیزی از محدودیت نمی‌بیند.
+            evidence_notes = []
+
+            if missing_paths:
+                evidence_notes.append(
+                    "محدودیت شواهد: این مسیرهای اولویت‌دار تا "
+                    "پایان گام‌ها خوانده نشدند: "
+                    + "، ".join(missing_paths)
+                    + "."
+                )
+
+            if missing_content:
+                if content_reads:
+                    evidence_notes.append(
+                        "محدودیت شواهد: این مسیرها در اجرای فعلی "
+                        "خوانده شده ولی با هدف درخواست ارتباط "
+                        "روشنی ندارند: "
+                        + "، ".join(
+                            sorted(content_reads)[
+                                :MAX_EVIDENCE_PATHS_PER_NUDGE
+                            ]
+                        )
+                        + "؛ ادعاهای بررسی فراتر از این شواهد "
+                        "نیست."
+                    )
+                else:
+                    evidence_notes.append(
+                        "محدودیت شواهد: محتوای هیچ فایل واقعیِ "
+                        "پروژه خوانده نشد؛ نتیجه فقط بر پایهٔ فهرست "
+                        "یا نمای کلی است و قطعی نیست."
+                    )
+
+            if content_status == "unverifiable":
+                evidence_notes.append(
+                    "محدودیت شواهد: درخواست نام فایل مشخصی ندارد "
+                    "و ارتباط شواهد خوانده‌شده با هدف درخواست "
+                    "قابل راستی‌آزمایی نیست؛ این گزارش فقط "
+                    "فایل‌های واقعیِ خوانده‌شده را فهرست می‌کند و "
+                    "متن پاسخ نهایی، متن مدل است."
+                )
+
+            if content_status == "blocked":
+                evidence_notes.append(
+                    "محدودیت امنیتی: نام فایل‌های نام‌برده در "
+                    "درخواست در فهرست ممنوعِ خواندن است؛ بدون "
+                    "خواندنِ این فایل‌ها، ادعای بررسی آن‌ها "
+                    "تأییدنشده محسوب می‌شود."
+                )
 
             # دروازهٔ تکمیل کار: برای یک درخواست تغییردهنده،
             # «کافی بودن شواهد» معیار پایان نیست؛ معیار، اعمال
@@ -13230,12 +13744,97 @@ def run_loop_steps(
                     )
                     continue
 
+            # Phase 3 — Completion Gate (اتصال حداقلی).
+            #
+            # همین‌جا، درست پیش از پذیرش FINAL: شواهد واقعیِ
+            # transcript و الزام‌های قطعیِ فایلیِ استخراجشده از
+            # درخواست به evaluate_completion() می‌روند. ادعای
+            # FINAL فقط final_claim است و هرگز شاهد تکمیل نیست.
+            #
+            # Gate فقط گزارش‌رسانی می‌کند و حداکثر یک یادآوری با
+            # همان بودجهٔ completion_nudges می‌دهد؛ سقف گام و هیچ
+            # مسیر Approval/Undo/Journal تغییری نمی‌کند. خطای Gate
+            # هم حلقه را نمی‌شکند (evaluate_completion_gate → None).
+            gate = None
+
+            if is_write_allowed(allow_write):
+                gate = evaluate_completion_gate(
+                    project_root,
+                    user_request,
+                    transcript,
+                    known_request_status=known_request_status,
+                    final_claim=bool(decision.get("final")),
+                )
+
+            if isinstance(gate, dict):
+                gate_status = gate.get("status")
+                gate_states = gate.get("requirement_states") or {}
+                gate_pending = sorted(
+                    req_id for req_id, state in gate_states.items()
+                    if state != "verified"
+                )
+
+                # incomplete: فقط وقتی الزام مشخص و قابل‌اقدامی هست و
+                # بودجه اجازه می‌دهد، یک تلاش دیگر. blocked دیگر
+                # ادامه نمی‌دهد (بی‌فایده) و unverifiable هرگز
+                # complete نمی‌شود و حلقه‌ای تازه نمی‌سازد.
+                if (
+                    gate_status == "incomplete"
+                    and gate_pending
+                    and not last_step
+                    and completion_nudges < MAX_COMPLETION_NUDGES
+                    and steps_used < max_steps
+                ):
+                    completion_nudges += 1
+                    observations.append(
+                        "نتیجه دروازه تکمیل: این الزام‌های فایلی با "
+                        "شاهدهای واقعیِ فعلی تأیید نشده‌اند: "
+                        + "، ".join(gate_pending)
+                        + ". هر کدام را با همان مسیر تأیید و Verify "
+                        "انجام بده؛ ادعای FINAL به‌تنهایی کافی نیست."
+                    )
+                    continue
+
+                if gate_status == "incomplete" and gate_pending:
+                    evidence_notes.append(
+                        "نتیجه دروازه تکمیل: این الزام‌های فایلی تا "
+                        "پایان گام‌ها تأییدنشده ماندند: "
+                        + "، ".join(gate_pending)
+                        + ". تکمیل کل درخواست بدون شاهد این موارد "
+                        "تأییدنشده است."
+                    )
+
+                elif gate_status == "blocked":
+                    evidence_notes.append(
+                        "نتیجه دروازه تکمیل: حداقل یک الزام فایلی به "
+                        "دلیل محدودیت قطعی قابل ادامه نیست؛ ادامه "
+                        "بی‌فایده است و این محدودیت در پذیرش FINAL "
+                        "لحاظ شد."
+                    )
+
+                elif gate_status == "unverifiable":
+                    evidence_notes.append(
+                        "نتیجه دروازه تکمیل: شواهد یا الزام‌های این "
+                        "درخواست برای نتیجه‌گیری قطعی کافی نیست؛ "
+                        "تکمیل کار تأییدنشده محسوب می‌شود."
+                    )
+
+                # complete: هیچ دخالتی؛ FINAL مثل قبل پذیرفته می‌شود.
+                # Gate هرگز ادعای تکمیل تولید نمی‌کند، پس «کامل فرض
+                # کردن» درخواست‌های دارای الزام‌های غیرفایلیِ
+                # استخراج‌نشده هم ممکن نیست.
+
             return build_loop_report(
                 project_name,
                 project_root,
                 transcript,
                 final_answer=decision.get("final") or "",
-                user_request=user_request,
+                notes=evidence_notes or None,
+                user_request=(
+                    user_request
+                    if is_write_allowed(allow_write)
+                    else None
+                ),
                 known_request_status=known_request_status
             )
 
@@ -13799,7 +14398,11 @@ def run_loop_steps(
             + ") پر شد؛ پاسخ نهایی از شواهد جمع‌آوری‌شده "
             "ساخته شد."
         ],
-        user_request=user_request,
+        user_request=(
+            user_request
+            if is_write_allowed(allow_write)
+            else None
+        ),
         known_request_status=known_request_status
     )
 
