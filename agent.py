@@ -36,7 +36,8 @@ DEFAULT_PROJECTS = {
     "agent-test": r"D:\AI\agent-test"
 }
 
-MODEL_URL = "http://127.0.0.1:8080/completion"
+import os as _os
+MODEL_URL = _os.environ.get("MODEL_URL", "http://127.0.0.1:8080/completion")
 
 # Phase 2: Multi-Agent feature flag.
 # When False (default), Local Agent behaves exactly as before.
@@ -3324,10 +3325,7 @@ def call_model(
             f"خطا در پیکربندی Provider مدل: {e}"
         )
 
-    if not _spec.uses_raw_prompt:
-        raise RuntimeError(
-            "Provider فعال با مسیر llama-server سازگار نیست."
-        )
+    _is_raw = _spec.uses_raw_prompt
 
     payload = _providers.build_payload(
         _spec,
@@ -3389,17 +3387,23 @@ def call_model(
             f"خطا در ارتباط با مدل: {e}"
         )
 
-    content = result.get(
-        "content",
-        ""
-    )
+    if _is_raw:
+        content = result.get(
+            "content",
+            ""
+        )
+    else:
+        try:
+            content = result["choices"][0]["message"]["content"]
+        except Exception:
+            content = ""
 
     if not content:
         raise RuntimeError(
             "مدل پاسخ متنی برنگرداند."
         )
 
-    return content.strip()
+    return str(content).strip()
 
 
 def search_subfolders(
@@ -3709,11 +3713,6 @@ def find_requested_files(project_root, user_request):
         ):
             continue
 
-        normalized = candidate.replace(
-            "\\",
-            "/"
-        )
-
         try:
             full_path = safe_path(
                 project_root,
@@ -3739,6 +3738,16 @@ def find_requested_files(project_root, user_request):
 
         except (ValueError, OSError):
             continue
+
+        # relative_path را از مسیر واقعی روی disk استخراج می‌کنیم
+        # (نه تو خالی از متن درخواست) تا کلید وضعیت در
+        # requested_mutation_status با مسیرهای mutation_targets_of_entry
+        # (که از آرگومان ابزار می‌آیند) تطبیق یابد، بدون تطبیق نام فایل یا fuzzy.
+        try:
+            rel_path = os.path.relpath(full_path, root)
+            normalized = normalize_relative_target(rel_path)
+        except ValueError:
+            normalized = normalize_relative_target(candidate)
 
         results.append(
             {
@@ -5117,6 +5126,43 @@ def delete_entry(
 
     if os.path.isfile(full_path):
         backup_path = create_backup(root, full_path)
+
+        # ثبت رویداد قبل از حذف فیزیکی؛ شکست ثبت => حذف انجام نمی‌شود.
+        journal_id = record_action(
+            action_type="delete",
+            tool="delete_entry",
+            args={"path": relative_path, "recursive": False},
+            project_root=root,
+            target=relative_display(root, full_path),
+            backup_path=(
+                relative_display(root, backup_path)
+                if backup_path else None
+            ),
+            before_state={
+                "existed_before": True,
+                "type": "file",
+                "sha1": (
+                    sha1_of_file(backup_path)
+                    if backup_path else None
+                ),
+                "restore_hint": (
+                    relative_display(root, backup_path)
+                    if backup_path else None
+                ),
+            },
+            execution_state=ACTION_STATE_PLANNED,
+            verify_state=None,
+            result_summary=(
+                "delete (file) planned: "
+                + relative_display(root, full_path)
+            ),
+        )
+
+        if not journal_id:
+            raise RuntimeError(
+                "ثبت رویداد Journal شکست خورد؛ حذف انجام نشد."
+            )
+
         os.remove(full_path)
 
         if os.path.exists(full_path):
@@ -5124,8 +5170,8 @@ def delete_entry(
                 "Verify ناموفق: فایل حذف نشد."
             )
 
-        # Phase A (Safety Foundation): ثبت passive در Journal.
-        record_action(
+        # ثبت نهایی پس از حذف موفق.
+        final_journal_id = record_action(
             action_type="delete",
             tool="delete_entry",
             args={"path": relative_path, "recursive": False},
@@ -5154,6 +5200,21 @@ def delete_entry(
                 + relative_display(root, full_path)
             ),
         )
+
+        if not final_journal_id:
+            # بازگردانی فوری از Backup در صورت شکست ثبت نهایی.
+            try:
+                if backup_path and os.path.isfile(backup_path):
+                    with open(backup_path, "rb") as f:
+                        data = f.read()
+                    with open(full_path, "wb") as f:
+                        f.write(data)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "ثبت نهایی Journal شکست خورد؛ فایل بازیابی شد. "
+                "Backup: " + str(backup_path)
+            )
 
         return {
             "operation": "delete",
@@ -7098,6 +7159,8 @@ LOOP_MODEL_N_PREDICT = 3200
 # با restart از بین میرود.
 CONVERSATION_MEMORY = []
 CONVERSATION_MEMORY_LIMIT = 6
+import contextvars as _cv
+_CURRENT_SESSION = _cv.ContextVar("current_session", default=None)
 CONVERSATION_MESSAGE_CHARS = 400
 
 # Plan در انتظار تأیید کاربر برای عملیات تغییردهنده.
@@ -7323,7 +7386,8 @@ def contains_any_word(text, keywords):
 def remember_conversation_message(
     role,
     text,
-    project_name=None
+    project_name=None,
+    session_id=None
 ):
     # حافظه کوتاه (in-memory) برای درخواستهای پشتسرهم.
     # سیستم حافظه دائمی نیست و روی دیسک ذخیره نمیشود.
@@ -7337,36 +7401,64 @@ def remember_conversation_message(
             message_text[:CONVERSATION_MESSAGE_CHARS] + " …"
         )
 
-    CONVERSATION_MEMORY.append({
-        "role": role,
-        "text": message_text,
-        "project": project_name,
-    })
+    if session_id is None:
+        session_id = _CURRENT_SESSION.get()
 
-    while len(CONVERSATION_MEMORY) > CONVERSATION_MEMORY_LIMIT:
-        CONVERSATION_MEMORY.pop(0)
+    import threading as _th
+    with _th.Lock():
+        CONVERSATION_MEMORY.append({
+            "role": role,
+            "text": message_text,
+            "project": project_name,
+            "session": session_id,
+        })
+
+        while len(CONVERSATION_MEMORY) > CONVERSATION_MEMORY_LIMIT:
+            CONVERSATION_MEMORY.pop(0)
 
 
-def clear_conversation_memory():
-    del CONVERSATION_MEMORY[:]
+def clear_conversation_memory(session_id=None, project_name=None):
+    if session_id is None:
+        session_id = _CURRENT_SESSION.get()
+    import threading as _th
+    with _th.Lock():
+        if session_id is None and project_name is None:
+            del CONVERSATION_MEMORY[:]
+            return
+        kept = []
+        for m in CONVERSATION_MEMORY:
+            if session_id is not None and m.get("session") != session_id:
+                kept.append(m)
+                continue
+            if project_name is not None and m.get("project") != project_name:
+                kept.append(m)
+                continue
+        del CONVERSATION_MEMORY[:]
+        CONVERSATION_MEMORY.extend(kept)
 
 
 def get_recent_conversation_text(
     project_name=None,
-    current_request=None
+    current_request=None,
+    session_id=None
 ):
-    # فقط پیامهای همین پروژه (یا پیامهای بدون پروژه).
+    if session_id is None:
+        session_id = _CURRENT_SESSION.get()
+
+    # فقط پیامهای همین نشست و همین پروژه (یا بدون پروژه).
     messages = [
         message for message in CONVERSATION_MEMORY
-        if not project_name
-        or message.get("project") in (None, project_name)
+        if (session_id is None or message.get("session") in (None, session_id))
+        and (not project_name or message.get("project") in (None, project_name))
     ]
 
     # پیام کاربر جاری دوباره در context تکرار نمیشود.
     if current_request and messages:
         last = messages[-1]
 
-        if last.get("role") == "user":
+        if last.get("role") == "user" and last.get("text") == (
+            "" if current_request is None else str(current_request).strip()
+        ):
             messages = messages[:-1]
 
     lines = []
@@ -10265,6 +10357,99 @@ def tool_run_command(project_root, args):
     )
 
 
+def tool_seo_fetch_page(project_root, args):
+    try:
+        import seo_adapter as _sa
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    timeout = int(tool_arg(args, "timeout") or 30)
+    r = _sa.run("fetch_page.py", [url, "--timeout", str(timeout)])
+    if not r.ok:
+        return tool_fail(r.error or r.stderr)
+    return tool_ok(str(r.data)[:4000] if r.data else r.raw_stdout, verified=True, data=r.data or {})
+
+
+def tool_seo_parse_html(project_root, args):
+    try:
+        import seo_adapter as _sa
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    file_path = tool_arg(args, "file", "path")
+    cli_args = ["--json"]
+    if url:
+        cli_args += ["--url", url]
+    if file_path:
+        cli_args += [file_path]
+    r = _sa.run("parse_html.py", cli_args)
+    if not r.ok:
+        return tool_fail(r.error or r.stderr)
+    return tool_ok(str(r.data)[:4000] if r.data else r.raw_stdout, verified=True, data=r.data or {})
+
+
+def tool_seo_sitemap(project_root, args):
+    try:
+        import seo_adapter as _sa
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    r = _sa.run("sitemap_discovery.py", [url, "--json"])
+    if not r.ok:
+        return tool_fail(r.error or r.stderr)
+    return tool_ok(str(r.data)[:4000] if r.data else r.raw_stdout, verified=True, data=r.data or {})
+
+
+def tool_seo_audit(project_root, args):
+    try:
+        import seo_adapter as _sa
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    r = _sa.run("fetch_page.py", [url])
+    if not r.ok:
+        return tool_fail(r.error or r.stderr)
+    r2 = _sa.run("parse_html.py", ["--url", url, "--json"])
+    if not r2.ok:
+        return tool_fail(r2.error or r2.stderr)
+    return tool_ok("SEO audit completed", verified=True, data={"fetch": r.data, "parse": r2.data})
+
+
+def tool_web_search(project_root, args):
+    try:
+        import web_research as _wr
+    except Exception as e:
+        return tool_fail(e)
+    q = tool_arg(args, "query", "q")
+    try:
+        r = _wr.web_search(q)
+    except Exception as e:
+        return tool_fail(e)
+    return tool_ok(_wr.format_search_results(r, q), verified=True, data={"count": len(r)})
+
+
+def tool_web_extract(project_root, args):
+    try:
+        import web_research as _wr
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    info = _wr.extract_page_text(url)
+    return tool_ok(_wr.format_page_text(info), verified=True, data={"url": url})
+
+
+def tool_seo_pagespeed(project_root, args):
+    try:
+        import seo_adapter as _sa
+    except Exception as e:
+        return tool_fail(e)
+    url = tool_arg(args, "url")
+    r = _sa.run("pagespeed_check.py", [url])
+    if not r.ok:
+        return tool_fail(r.error or r.stderr)
+    return tool_ok(r.raw_stdout[:4000], verified=True, data=r.data or {})
+
+
 # فهرست سفید ابزارهای Agent.
 # Tool-calling فقط روی همین نام‌ها مجاز است.
 TOOL_REGISTRY = {
@@ -10316,6 +10501,48 @@ TOOL_REGISTRY = {
         "usage": '{}',
         "description": "تحلیل فقط-خواندنی سایت/وردپرس (بدون تغییر)",
     },
+    "web_search": {
+        "mutating": False,
+        "run": tool_web_search,
+        "usage": '{"query": "seo best practices"}',
+        "description": "جستجوی وب (خواندنی)",
+    },
+    "web_extract": {
+        "mutating": False,
+        "run": tool_web_extract,
+        "usage": '{"url": "https://example.com"}',
+        "description": "استخراج متن صفحه (خواندنی)",
+    },
+    "seo_fetch_page": {
+        "mutating": False,
+        "run": tool_seo_fetch_page,
+        "usage": '{"url": "https://example.com"}',
+        "description": "واکشی صفحه برای تحلیل SEO (خواندنی)",
+    },
+    "seo_parse_html": {
+        "mutating": False,
+        "run": tool_seo_parse_html,
+        "usage": '{"url": "https://example.com"}',
+        "description": "پارس HTML و استخراج عناصر SEO (خواندنی)",
+    },
+    "seo_sitemap": {
+        "mutating": False,
+        "run": tool_seo_sitemap,
+        "usage": '{"url": "https://example.com"}',
+        "description": "کشف sitemap (خواندنی)",
+    },
+    "seo_pagespeed": {
+        "mutating": False,
+        "run": tool_seo_pagespeed,
+        "usage": '{"url": "https://example.com"}',
+        "description": "بررسی PageSpeed (خواندنی)",
+    },
+    "seo_audit": {
+        "mutating": True,
+        "run": tool_seo_audit,
+        "usage": '{"url": "https://example.com"}',
+        "description": "تحلیل SEO کامل (نیازمند تأیید)",
+    },
     "write_file": {
         "mutating": True,
         "run": tool_write_file,
@@ -10363,6 +10590,9 @@ TOOL_REGISTRY = {
     },
 }
 
+_WEB_RESEARCH_ALLOWED_TOOLS = frozenset(("web_search", "web_extract"))
+
+
 MUTATING_TOOLS = tuple(
     name for name, spec in TOOL_REGISTRY.items()
     if spec["mutating"]
@@ -10403,7 +10633,7 @@ def suggest_tool_name(unknown_name):
     return None
 
 
-def build_tool_reference():
+def build_tool_reference(allowed_tools=None):
     # متن راهنمای ابزارها برای مدل؛ از همان Registry ساخته
     # میشود تا هرگز با فهرست سفید اختلاف نداشته باشد.
     #
@@ -10415,6 +10645,8 @@ def build_tool_reference():
     ]
 
     for name, spec in TOOL_REGISTRY.items():
+        if allowed_tools is not None and name not in allowed_tools:
+            continue
         marker = " [needs approval]" if spec["mutating"] else ""
         lines.append("- " + name + marker)
         lines.append("    ARGS: " + spec["usage"])
@@ -11302,7 +11534,7 @@ def build_multi_file_plan_summary(pending):
     return "\n".join(lines)
 
 
-def build_loop_system_prompt():
+def build_loop_system_prompt(allowed_tools=None):
     # Phase G.2 - Agent Response Intelligence (Guidance only).
     # Core Logic / Registry / Safety / Approval / Journal / Mutation
     # Flow / web_agent.py بدون تغيير باقي مانده‌اند.
@@ -11312,7 +11544,7 @@ You work ONLY inside the selected project on this computer.
 
 You use the tools below, ONE tool per step.
 
-""" + build_tool_reference() + """
+""" + build_tool_reference(allowed_tools) + """
 
 PROTOCOL - answer exactly in this format:
 
@@ -11939,7 +12171,17 @@ def build_loop_report(
 
             # گزارش نمایشی هم باید شواهد را نشان دهد، وگرنه
             # کاربر دقیقاً همان چیزی را نمی‌بیند که مدل دیده.
-            step_body = entry["result"].get("text")
+            result_entry = entry.get("result")
+            if isinstance(result_entry, dict):
+                step_body = result_entry.get("text")
+                data = result_entry.get("data") or {}
+            elif isinstance(result_entry, str):
+                step_body = result_entry
+                data = {}
+            else:
+                step_body = None
+                data = {}
+
             step_limit = MAX_REPORT_STEP_CHARS
 
             if (
@@ -11957,8 +12199,6 @@ def build_loop_report(
             ).replace("\n", "\n   ")
 
             lines.append("   " + step_text)
-
-            data = entry["result"].get("data") or {}
 
             if data.get("backup_path"):
                 lines.append(
@@ -12120,6 +12360,40 @@ def build_loop_report(
             verify_lines.append(label + "Verify ناموفق بود.")
         else:
             verify_lines.append(label + "Verify انجام نشد.")
+
+    try:
+        _records = []
+        for _e in (transcript or []):
+            if not isinstance(_e, dict):
+                continue
+            _tool = str(_e.get("tool") or "")
+            if _tool not in ("fetch_page", "web_search"):
+                continue
+            _res = _e.get("result")
+            _status = "ok"
+            if isinstance(_res, dict):
+                if _res.get("ok") is False:
+                    _status = "failed"
+                elif "(no readable text" in str(_res.get("text", "")):
+                    _status = "empty"
+                elif str(_res.get("text", "")).strip().lower() in ("(no results)",) or (_res.get("data") or {}).get("hits") == 0:
+                    _status = "no_hits"
+            _rec = {"tool": _tool, "status": _status}
+            if isinstance(_res, dict):
+                _data = _res.get("data") or {}
+                if "url" in _data:
+                    _rec["url"] = _data["url"]
+                elif "url" in (_e.get("args") or {}):
+                    _rec["url"] = (_e.get("args") or {}).get("url")
+                if "query" in _data:
+                    _rec["query"] = _data["query"]
+                if "hits" in _data:
+                    _rec["hits"] = _data["hits"]
+            _records.append(_rec)
+        global _LAST_LOOP_REPORT_LEDGER
+        _LAST_LOOP_REPORT_LEDGER = _records
+    except Exception:
+        pass
 
     return build_report(
         "Agentic Loop",
@@ -13421,7 +13695,8 @@ def run_loop_steps(
     stop_event=None,
     progress=None,
     known_request_status=None,
-    known_read_paths=None
+    known_read_paths=None,
+    allowed_tools=None
 ):
     # هسته حلقه:
     # مدل یک گام را انتخاب میکند → Agent همان ابزار را
@@ -13438,7 +13713,7 @@ def run_loop_steps(
     # Resume یک transcript تازه می‌سازد، بدون این کلید Readهای
     # واقعیِ همان درخواست فراموش می‌شدند و ویرایشِ درستِ فایل
     # دوم (مثل style.css) به‌اشتباه رد می‌شد.
-    system_prompt = build_loop_system_prompt()
+    system_prompt = build_loop_system_prompt(allowed_tools)
     rejections = []
     duplicate_blocks = 0
     evidence_nudges = 0
@@ -13755,6 +14030,7 @@ def run_loop_steps(
             # همان بودجهٔ completion_nudges می‌دهد؛ سقف گام و هیچ
             # مسیر Approval/Undo/Journal تغییری نمی‌کند. خطای Gate
             # هم حلقه را نمی‌شکند (evaluate_completion_gate → None).
+            gate_blocking = False
             gate = None
 
             if is_write_allowed(allow_write):
@@ -13796,6 +14072,7 @@ def run_loop_steps(
                     continue
 
                 if gate_status == "incomplete" and gate_pending:
+                    gate_blocking = True
                     evidence_notes.append(
                         "نتیجه دروازه تکمیل: این الزام‌های فایلی تا "
                         "پایان گام‌ها تأییدنشده ماندند: "
@@ -13805,6 +14082,7 @@ def run_loop_steps(
                     )
 
                 elif gate_status == "blocked":
+                    gate_blocking = True
                     evidence_notes.append(
                         "نتیجه دروازه تکمیل: حداقل یک الزام فایلی به "
                         "دلیل محدودیت قطعی قابل ادامه نیست؛ ادامه "
@@ -13813,6 +14091,7 @@ def run_loop_steps(
                     )
 
                 elif gate_status == "unverifiable":
+                    gate_blocking = True
                     evidence_notes.append(
                         "نتیجه دروازه تکمیل: شواهد یا الزام‌های این "
                         "درخواست برای نتیجه‌گیری قطعی کافی نیست؛ "
@@ -13823,6 +14102,23 @@ def run_loop_steps(
                 # Gate هرگز ادعای تکمیل تولید نمی‌کند، پس «کامل فرض
                 # کردن» درخواست‌های دارای الزام‌های غیرفایلیِ
                 # استخراج‌نشده هم ممکن نیست.
+
+            # اگر گیت مسدود/ناقص/تأییدنشده باشد و روش ادامه‌نشود،
+            # ادعای مدل به عنوان موفقیت پذیرفته نشود.
+            if gate_blocking:
+                return build_loop_report(
+                    project_name,
+                    project_root,
+                    transcript,
+                    final_answer="",
+                    notes=evidence_notes or None,
+                    user_request=(
+                        user_request
+                        if is_write_allowed(allow_write)
+                        else None
+                    ),
+                    known_request_status=known_request_status
+                )
 
             return build_loop_report(
                 project_name,
@@ -13837,6 +14133,12 @@ def run_loop_steps(
                 ),
                 known_request_status=known_request_status
             )
+
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            observation = "ابزار غیرمجاز در این حالت: " + str(tool_name)
+            transcript.append({"step": steps_used + 1, "tool": tool_name, "args": {}, "result": observation})
+            steps_used += 1
+            continue
 
         spec = TOOL_REGISTRY.get(tool_name)
 
@@ -14414,7 +14716,8 @@ def run_agentic_loop(
     allow_write=False,
     stop_event=None,
     max_steps=MAX_AGENT_STEPS,
-    progress=None
+    progress=None,
+    allowed_tools=None
 ):
     # شروع یک حلقه Agentic تازه.
     return run_loop_steps(
@@ -14428,7 +14731,8 @@ def run_agentic_loop(
         correction_attempts=0,
         max_steps=max_steps,
         stop_event=stop_event,
-        progress=progress
+        progress=progress,
+        allowed_tools=allowed_tools
     )
 
 
@@ -15190,7 +15494,8 @@ def run_agent(
     project_name,
     allow_write=False,
     stop_event=None,
-    progress=None
+    progress=None,
+    session_id=None
 ):
     # دروازه ورودی Agent:
     # 0) General Mode: بدون پروژه، فقط پاسخ متنی (هیچ ابزار
@@ -15211,8 +15516,11 @@ def run_agent(
     # خطای داخلی گزارش می‌شد.
     canonical_path_failed = False
 
+    _session_token = _CURRENT_SESSION.set(session_id)
+
     remember_conversation_message(
-        "user", user_request, project_name
+        "user", user_request, project_name,
+        session_id=session_id
     )
 
     # General Mode:
@@ -15234,16 +15542,14 @@ def run_agent(
 
         try:
             general_is_executive = bool(should_use_agentic_loop(
-                user_request, general_effective_root
+                user_request, None
             ))
         except Exception:
             general_is_executive = False
 
+        # General Mode has no pending plan of its own; control replies
+        # must never enter the project/agentic pipeline.
         general_is_control = False
-        try:
-            general_is_control = detect_control_reply(user_request) is not None
-        except Exception:
-            general_is_control = False
 
         if not general_is_executive and not general_is_control:
             general_result = run_general_task(
@@ -15542,13 +15848,17 @@ def run_agent(
                 use_agentic_loop = True
 
             if use_agentic_loop:
+                _allowed = None
+                if is_general_mode(project_name):
+                    _allowed = _WEB_RESEARCH_ALLOWED_TOOLS
                 loop_result = run_agentic_loop(
                     user_request,
-                    project_root,
+                    None,
                     project_name,
                     allow_write=allow_write,
                     stop_event=stop_event,
-                    progress=progress
+                    progress=progress,
+                    allowed_tools=_allowed,
                 )
 
                 if loop_result is not None:
@@ -15632,6 +15942,18 @@ def run_agent(
             user_request, result, project_name=project_name
         )
 
+        return result
+
+    if is_general_mode(project_name):
+        result = run_general_task(
+            user_request,
+            project_name=project_name,
+            allow_write=allow_write,
+            stop_event=stop_event,
+            progress=progress,
+        )
+        remember_conversation_message("agent", result, project_name)
+        _record_durable_interaction(user_request, result, project_name=project_name)
         return result
 
     try:
@@ -16073,3 +16395,27 @@ CURRENT CONTENT:
     # تنها مسیر مجاز برای تغییر فایل، مسیر canonical است
     # (Plan → Re-validation → Approval → Execute → Verify).
     return LEGACY_DIRECT_WRITE_REFUSED
+
+
+
+def has_unnegated_keyword(text, keywords):
+    text_l = (text or "").lower()
+    neg_markers = ("do not", "don't", "not ", "نکن", "نده", "نباشد", "never")
+    for kw in (keywords or ()):
+        kw_l = str(kw).lower()
+        idx = text_l.find(kw_l)
+        if idx < 0:
+            continue
+        left = text_l[max(0, idx - 50): idx]
+        right = text_l[idx + len(kw_l): idx + len(kw_l) + 60]
+        if any(m in left or m in right for m in neg_markers):
+            continue
+        return True
+    return False
+
+
+_LAST_LOOP_REPORT_LEDGER = []
+
+
+def get_loop_report_ledger(report=None):
+    return list(_LAST_LOOP_REPORT_LEDGER)

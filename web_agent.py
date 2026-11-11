@@ -194,7 +194,8 @@ def resolve_allow_write(mode):
 # تنها منبع حقیقت provider/model برای Status Header و
 # SQLite. agent.py تغییری نمی‌کند؛ فقط MODEL_URL آن
 # خوانده می‌شود.
-RUNTIME_PROVIDER = "local"
+import os as _os
+RUNTIME_PROVIDER = _os.environ.get("MODEL_PROVIDER", "local")
 RUNTIME_MODEL = MODEL_URL
 
 runtime_info = {
@@ -453,6 +454,7 @@ def run_agent_with_status(
     allow_write=False,
     stop_event=None,
     progress=None,
+    session_id=None,
 ):
     # Wrapper در لایه web: قبل از run_agent running،
     # بعد از آن done/error. run_agent خودش حذف نمی‌شود.
@@ -467,6 +469,7 @@ def run_agent_with_status(
             allow_write=allow_write,
             stop_event=stop_event,
             progress=progress,
+            session_id=session_id,
         )
         if stop_event is not None and stop_event.is_set():
             set_agent_status(
@@ -491,6 +494,7 @@ def run_agent_background(
     project_name,
     allow_write=False,
     stop_event=None,
+    session_id=None,
 ):
     global last_result, current_stop_event
     started_at = time.time()
@@ -503,6 +507,7 @@ def run_agent_background(
             allow_write=allow_write,
             stop_event=stop_event,
             progress=make_progress_callback(),
+            session_id=session_id,
         )
 
     except Exception as e:
@@ -602,6 +607,7 @@ def run_approval_background(
     project_name,
     allow_write=False,
     stop_event=None,
+    session_id=None,
 ):
     # اجرای همان Gate تأیید موجود در agent.py.
     # خروجی None یعنی «Pending Action وجود ندارد»؛ در آن
@@ -1549,6 +1555,7 @@ button:hover {
 <form method="post" id="agentForm">
 
 <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+<input type="hidden" name="session_id" value="{{ session_id }}">
 
 <label for="project">پروژه</label>
 
@@ -1567,6 +1574,30 @@ button:hover {
 {% endfor %}
 </select>
 
+</div>
+
+<div class="settings-box">
+<label>Provider</label>
+<select name="provider">
+    <option value="">پیش‌فرض</option>
+    <option value="local">Local</option>
+    <option value="openrouter">OpenRouter</option>
+    <option value="openai_compatible">OpenAI Compatible</option>
+</select>
+<input type="text" name="base_url" placeholder="Base URL (optional)">
+<input type="password" name="api_key" placeholder="API Key (optional)">
+<input type="text" name="model" placeholder="Model (optional)">
+</div>
+
+<div class="provider-box">
+<label for="provider">Provider</label>
+<select id="provider" name="provider">
+    <option value="">پیش‌فرض</option>
+    <option value="local">Local</option>
+    <option value="openrouter">OpenRouter</option>
+    <option value="groq">Groq</option>
+    <option value="openai_compatible">OpenAI Compatible</option>
+</select>
 </div>
 
 <div class="mode-box">
@@ -2387,6 +2418,11 @@ def index():
     if not projects:
         projects = {"agent-test": r"D:\AI\agent-test"}
 
+    import uuid
+    session_id = request.form.get("session_id") if request.method == "POST" else None
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
     result = ""
     request_text = ""
     project_name = next(iter(projects))
@@ -2457,6 +2493,35 @@ def index():
             "read"
         )
 
+        provider = request.form.get("provider")
+        base_url = request.form.get("base_url")
+        api_key = request.form.get("api_key")
+        model = request.form.get("model")
+
+        if provider:
+            set_runtime_info(provider=provider)
+            import os as _os
+            _os.environ["LLM_PROVIDER"] = provider
+
+        if base_url:
+            import os as _os
+            _os.environ["LOCAL_AGENT_LLM_BASE_URL"] = base_url
+            _os.environ["OPENROUTER_BASE_URL"] = base_url
+
+        if api_key:
+            import os as _os
+            _os.environ["LOCAL_AGENT_LLM_API_KEY"] = api_key
+            _os.environ["OPENROUTER_API_KEY"] = api_key
+
+        if model:
+            import os as _os
+            _os.environ["LLM_MODEL"] = model
+
+        session_id = request.form.get("session_id")
+        if not session_id:
+            import uuid
+            session_id = str(uuid.uuid4())
+
         # دکمه‌های تأیید/لغو action را به‌صورت صریح
         # می‌فرستند. این شاخه قبل از هر پردازش دیگری
         # بررسی می‌شود تا «تأیید» هرگز به‌عنوان درخواست
@@ -2496,6 +2561,7 @@ def index():
                         "project_name": project_name,
                         "allow_write": allow_write,
                         "stop_event": stop_event,
+                        "session_id": session_id,
                     },
                     daemon=True,
                 )
@@ -2534,6 +2600,7 @@ def index():
                         "project_name": project_name,
                         "allow_write": allow_write,
                         "stop_event": stop_event,
+                        "session_id": session_id,
                     },
                     daemon=True,
                 )
@@ -2581,6 +2648,7 @@ def index():
         # تا هر form و fetch آن را همراه بفرستد.
         csrf_token=CSRF_TOKEN,
         csrf_field=CSRF_FIELD_NAME,
+        session_id=session_id,
     )
 
 
@@ -2783,6 +2851,7 @@ def rollback_route():
         # Phase J — CSRF (همان دو متغیرِ صفحهٔ اصلی).
         csrf_token=CSRF_TOKEN,
         csrf_field=CSRF_FIELD_NAME,
+        session_id=session_id,
     )
 
 

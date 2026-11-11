@@ -1,0 +1,12 @@
+# Read-only web research tools (added in the web-research phase).
+#
+# These are the ONLY new third-party dependencies introduced by this phase.
+# All transitive requirements (lxml, primp, courlan, htmldate, justext,
+# charset-normalizer, urllib3, certifi, ...) are resolved automatically from
+# these two pins and are already installed in the project virtual
+# environment (.venv, Python 3.14.6). No existing package was changed.
+#
+# Reproduce with:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+ddgs==9.16.0
+trafilatura==2.3.1

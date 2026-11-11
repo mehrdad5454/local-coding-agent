@@ -244,8 +244,12 @@ def get_provider(provider_id: str) -> LLMProviderSpec:
 
 
 def default_provider() -> LLMProviderSpec:
-    """Return the current default provider (llama.cpp local)."""
-    return PROVIDER_REGISTRY[DEFAULT_PROVIDER_ID]
+    """Return the provider selected via LLM_PROVIDER env (default local)."""
+    import os
+    pid = os.environ.get("LLM_PROVIDER", DEFAULT_PROVIDER_ID)
+    if pid not in PROVIDER_REGISTRY:
+        pid = DEFAULT_PROVIDER_ID
+    return PROVIDER_REGISTRY[pid]
 
 
 def list_providers() -> List[str]:
@@ -434,7 +438,7 @@ def build_payload(
         }
 
     return {
-        "model": spec.model or "",
+        "model": (spec.model or __import__("os").environ.get("LLM_MODEL", "")),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
