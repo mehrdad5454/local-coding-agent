@@ -10136,6 +10136,10 @@ For finishing:
 THOUGHT: <one short line>
 FINAL: <answer for the user in Persian, following the FINAL structure below>
 
+IMPORTANT:
+- برای انجام کارها، از ابزارهای موجود استفاده کن. به جای توضیح دادن، ابزار را فراخوانی کن.
+- When the user asks to read/show/inspect/search files or project state, you MUST call the appropriate tool (e.g. read_file, read_files, list_directory, search_in_files) and use real observations. Do not guess or answer from assumptions.
+
 AUDIENCE AND LANGUAGE:
 - The FINAL answer is written for a human, not for debug or terminal.
 - The FINAL answer MUST be in Persian.
