@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local Coding Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1 class="app-title">Local Coding Agent</h1>
+      <div class="conn" title="وضعیت اتصال به سرور محلی">
+        <span id="connDot" class="dot"></span>
+        <span id="connText">نامشخص</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button type="button" class="btn ghost" id="clearChatBtn">Clear Chat</button>
+      <button type="button" class="btn ghost" id="settingsToggle">تنظیمات</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <!-- ستون راست: چت (در چیدمان RTL راست قرار می‌گیرد) -->
+    <section class="col col-chat">
+      <div class="panel-header">چت</div>
+      <div class="panel-body" id="chatScroll">
+        <div id="statusBanner" class="status-line status-{{ status_class|default('idle') }}">
+          <span id="statusMsg">{{ status_text|default('آماده') }}</span>
+          {% if status_badge %}<span class="badge" id="statusBadge">{{ status_badge }}</span>{% endif %}
+        </div>
+
+        <div id="chatHistoryBox" class="chat-history-box">
+          <div class="card-head">تاریخچه گفتگو</div>
+          <div id="chatHistoryList"></div>
+        </div>
+
+        {% if result %}
+        <div class="card" id="resultCard">
+          <div class="card-head"><span class="role agent">Agent</span><button type="button" class="btn ghost shrink" id="copyButton">کپی نتیجه</button></div>
+          <div class="prewrap" id="resultBox">{{ result }}</div>
+        </div>
+        {% endif %}
+
+        {% if approval_pending %}
+        <div class="card approval-box" id="approvalBox">
+          <div class="card-head"><span class="role">تصمیم درباره Plan</span></div>
+          <form method="post" action="/" class="approval-row" id="approvalForm">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <input type="hidden" name="project" value="{{ project_name|e }}">
+            <input type="hidden" name="mode" value="{{ mode }}">
+            <input type="hidden" name="session_id" value="{{ session_id }}">
+            <div class="actions">
+              <button type="submit" name="approval_action" value="approve" class="btn primary">تأیید</button>
+              <button type="submit" name="approval_action" value="cancel" class="btn">لغو</button>
+            </div>
+            <div class="note">«تأیید» و «لغو» از مسیر امن Approval عبور می‌کنند.</div>
+          </form>
+        </div>
+        {% endif %}
+
+        {% if file_plan %}
+        <div class="card plan-box">
+          <div class="card-head">Plan اجرای درخواست</div>
+          <ul class="plan-list">
+            {% for item in file_plan.files %}
+            <li class="plan-item">{{ item.relative_path|e }} <span class="badge">{% if item.exists %}modify{% else %}create{% endif %}</span></li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        {% if diff_state == "changed" %}
+        <div class="card diff-box">
+          <div class="card-head">{{ diff_title }}</div>
+          <pre class="diff-text">{{ diff_text|e }}</pre>
+        </div>
+        {% elif diff_state == "unchanged" %}
+        <div class="card diff-box"><div class="card-head">{{ diff_title }}</div><div class="note">فایل تغییری نکرد؛ Diff خالی است.</div></div>
+        {% elif diff_state == "new_file" %}
+        <div class="card diff-box"><div class="card-head">{{ diff_title }}</div><div class="note">فایل جدید ایجاد شد؛ Diff قبلی وجود ندارد.</div></div>
+        {% endif %}
+
+        {% if validation_state == "valid" %}
+        <div class="card validation-box">
+          <div class="card-head">Validation بعد از Write</div>
+          <div class="note">فایل نوشته‌شده معتبر است.</div>
+          <pre class="validation-text">{{ validation_text|e }}</pre>
+        </div>
+        {% elif validation_state == "invalid" %}
+        <div class="card validation-box">
+          <div class="card-head">Validation بعد از Write</div>
+          <div class="note status-error">Validation ناموفق بود.</div>
+          <pre class="validation-text">{{ validation_text|e }}</pre>
+        </div>
+        {% endif %}
+
+        <div class="card rollback-box">
+          <div class="card-head">بازگردانی از Backup (Rollback)</div>
+          <form method="post" action="/rollback">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <input type="hidden" name="project" value="{{ project_name|e }}">
+            <input type="hidden" name="mode" value="{{ mode }}">
+            <div class="row">
+              <input type="text" name="file" value="{{ rollback_target|e }}" placeholder="ai-agent/backup-test.txt" required>
+              <button type="submit" class="btn shrink">بازگردانی</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="panel-footer">
+        <form method="post" id="agentForm" action="/">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="session_id" value="{{ session_id }}">
+
+          <div class="row" style="margin-bottom:8px;">
+            <div>
+              <label for="project">پروژه</label>
+              <select id="project" name="project">
+                <option value="general" {% if project_name == "general" %}selected{% endif %}>General / بدون پروژه</option>
+                {% for name in projects %}
+                <option value="{{ name }}" {% if project_name == name %}selected{% endif %}>{{ name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="shrink" style="align-self:flex-end; display:flex; gap:6px;">
+              <button type="submit" formaction="/add-project" formmethod="post" class="btn" title="افزودن پروژه">+</button>
+              {% if project_name != "agent-test" and project_name != "general" %}
+              <button type="submit" formaction="/remove-project" formmethod="post" name="name" value="{{ project_name|e }}" class="btn" title="حذف پروژه">حذف</button>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="mode-options">
+            <div class="mode-option"><input type="radio" id="read" name="mode" value="read" {% if mode != "write" %}checked{% endif %}><label for="read">فقط بررسی</label></div>
+            <div class="mode-option"><input type="radio" id="write" name="mode" value="write" {% if mode == "write" %}checked{% endif %}><label for="write">اعمال تغییر</label></div>
+          </div>
+
+          <label for="request">درخواست</label>
+          <textarea id="request" name="request" placeholder="چه کاری انجام دهم؟">{{ request_text }}</textarea>
+          <div class="actions">
+            <button type="submit" id="submitButton" class="btn primary">اجرای درخواست</button>
+            <button type="button" id="stopButton" class="btn" disabled>توقف اجرا</button>
+          </div>
+
+          <div id="settingsPanel" class="settings-panel">
+            <div class="settings-grid">
+              <div>
+                <label for="provider">Provider</label>
+                <select id="provider" name="provider">
+                  <option value="">پیش‌فرض</option>
+                  <option value="local">Local</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="groq">Groq</option>
+                  <option value="openai_compatible">OpenAI Compatible</option>
+                </select>
+              </div>
+              <div>
+                <label for="model">Model</label>
+                <input type="text" id="model" name="model" placeholder="Model (optional)">
+              </div>
+              <div class="full">
+                <label for="base_url">Base URL</label>
+                <input type="text" id="base_url" name="base_url" placeholder="Base URL (optional)">
+              </div>
+              <div class="full">
+                <label for="api_key">API Key</label>
+                <input type="password" id="api_key" name="api_key" placeholder="API Key (optional)">
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- ستون چپ: کنسول -->
+    <aside class="col col-console">
+      <div class="panel-header">کنسول (لاگ عملیات)</div>
+      <div class="panel-body">
+        <div id="progressBox" class="hidden">
+          <div id="progressList" class="console-list"></div>
+        </div>
+        <div id="consoleHint" class="note">هنوز رویدادی ثبت نشده است.</div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+(function() {
+  var form = document.getElementById('agentForm');
+  var submitButton = document.getElementById('submitButton');
+  var stopButton = document.getElementById('stopButton');
+  var settingsToggle = document.getElementById('settingsToggle');
+  var settingsPanel = document.getElementById('settingsPanel');
+  var connDot = document.getElementById('connDot');
+  var connText = document.getElementById('connText');
+  var statusMsg = document.getElementById('statusMsg');
+  var csrfToken = "{{ csrf_token }}";
+
+  if (settingsToggle && settingsPanel) {
+    settingsToggle.addEventListener('click', function() {
+      settingsPanel.classList.toggle('open');
+    });
+  }
+
+  if (form && submitButton) {
+    form.addEventListener('submit', function(e) {
+      if (e.submitter && e.submitter.formAction && e.submitter.formAction.indexOf('/add-project') === -1 && e.submitter.formAction.indexOf('/remove-project') === -1) {
+        submitButton.disabled = true;
+        submitButton.textContent = 'در حال اجرا...';
+        if (stopButton) stopButton.disabled = false;
+      }
+      if (!e.submitter || e.submitter.id === 'submitButton') {
+        submitButton.disabled = true;
+        submitButton.textContent = 'در حال اجرا...';
+        if (stopButton) stopButton.disabled = false;
+      }
+    });
+  }
+
+  var requestEl = document.getElementById('request');
+  if (requestEl && form) {
+    requestEl.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        if (this.value.trim()) { e.preventDefault(); form.requestSubmit(); }
+      }
+    });
+  }
+
+  function setConn(ok) {
+    if (!connDot || !connText) return;
+    if (ok) { connDot.classList.add('ok'); connText.textContent = 'متصل'; }
+    else { connDot.classList.remove('ok'); connText.textContent = 'قطع'; }
+  }
+
+  function stopAgent() {
+    fetch('/stop', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }})
+      .then(function(r){ return r.json(); })
+      .then(function(){ if (stopButton) stopButton.disabled = true; if (submitButton){ submitButton.disabled=false; submitButton.textContent='اجرای درخواست'; } })
+      .catch(function(){ if (stopButton) stopButton.disabled = true; });
+  }
+  if (stopButton) stopButton.addEventListener('click', stopAgent);
+
+  function badgeLabel(state) {
+    var map = { running:'در حال اجرا', done:'کامل شد', error:'خطا', stopped:'متوقف شد', idle:'آماده' };
+    return map[state] || state || '';
+  }
+
+  function renderProgress(events) {
+    var wrap = document.getElementById('progressBox');
+    var list = document.getElementById('progressList');
+    var hint = document.getElementById('consoleHint');
+    if (!wrap || !list) return;
+    list.innerHTML = '';
+    if (!events || !events.length) { wrap.classList.add('hidden'); if (hint) hint.style.display=''; return; }
+    wrap.classList.remove('hidden'); if (hint) hint.style.display='none';
+    events.slice(-40).forEach(function(ev) {
+      var d = ev.data || {};
+      var item = document.createElement('div');
+      var cls = 'log-item';
+      if (ev.event === 'tool_done') cls += d.ok ? ' log-ok' : ' log-bad';
+      else if (ev.event === 'awaiting_approval') cls += ' log-wait';
+      item.className = cls;
+      var title = document.createElement('div'); title.className='log-title';
+      title.textContent = (ev.event || 'event') + (d.step ? (' • گام ' + d.step) : '');
+      var meta = document.createElement('div'); meta.className='log-meta prewrap';
+      var parts = [];
+      if (d.tool) parts.push('tool: ' + d.tool);
+      if (d.max_steps) parts.push('max_steps: ' + d.max_steps);
+      if (ev.event === 'tool_done') parts.push(d.ok ? 'ok' : 'failed');
+      meta.textContent = parts.join(' | ') || JSON.stringify(d);
+      item.appendChild(title); item.appendChild(meta);
+      list.appendChild(item);
+    });
+    var pb = wrap.parentElement; if (pb) pb.scrollTop = pb.scrollHeight;
+  }
+
+  function renderChatHistory(history) {
+    var list = document.getElementById('chatHistoryList');
+    if (!list) return;
+    list.innerHTML = '';
+    (history || []).slice(-5).reverse().forEach(function(item) {
+      var wrap = document.createElement('div'); wrap.className = 'card';
+      var h = document.createElement('div'); h.className='card-head';
+      h.innerHTML = '<span class="role">کاربر</span><span class="mono">'+(item.project||'')+'</span>';
+      var p = document.createElement('div'); p.className='prewrap'; p.textContent = item.prompt || '';
+      var arole = document.createElement('div'); arole.className='card-head'; arole.style.marginTop='8px';
+      arole.innerHTML = '<span class="role agent">Agent</span><span>'+badgeLabel(item.state)+'</span>';
+      var r = document.createElement('div'); r.className='prewrap'; r.textContent = item.response || '';
+      wrap.appendChild(h); wrap.appendChild(p); wrap.appendChild(arole); wrap.appendChild(r);
+      list.appendChild(wrap);
+    });
+  }
+
+  function renderLastResult(data) {
+    var state = data.status;
+    if (state !== 'done' && state !== 'error' && state !== 'stopped') return;
+    var text = data.last_result || '';
+    if (!text) return;
+    var card = document.getElementById('resultCard');
+    var box = document.getElementById('resultBox');
+    if (!box) {
+      var scroll = document.getElementById('chatScroll');
+      card = document.createElement('div'); card.className='card'; card.id='resultCard';
+      var head = document.createElement('div'); head.className='card-head';
+      head.innerHTML = '<span class="role agent">Agent</span><button type="button" class="btn ghost shrink" id="copyButtonDyn">کپی نتیجه</button>';
+      box = document.createElement('div'); box.className='prewrap'; box.id='resultBox';
+      card.appendChild(head); card.appendChild(box);
+      if (scroll) scroll.insertBefore(card, document.getElementById('chatHistoryBox') ? document.getElementById('chatHistoryBox').nextSibling : null);
+      var cb = document.getElementById('copyButtonDyn');
+      if (cb) cb.addEventListener('click', function(){ copyText(box.textContent||'', cb); });
+    }
+    box.textContent = text;
+  }
+
+  function copyText(text, btn) {
+    if (!text) return;
+    var done = function(){ var o=btn.textContent; btn.textContent='کپی شد'; setTimeout(function(){ btn.textContent=o; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(done).catch(function(){}); return; }
+    var ta = document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch(e){} document.body.removeChild(ta);
+  }
+  var copyBtn = document.getElementById('copyButton');
+  if (copyBtn) copyBtn.addEventListener('click', function(){ var b=document.getElementById('resultBox'); copyText(b?b.textContent:'', copyBtn); });
+
+  function pollStatus() {
+    fetch('/status').then(function(r){ return r.json(); }).then(function(data){
+      setConn(true);
+      var st = data.status || 'idle';
+      if (statusMsg) statusMsg.textContent = data.message || badgeLabel(st);
+      var banner = document.getElementById('statusBanner');
+      if (banner) banner.className = 'status-line status-' + st;
+      renderProgress(data.progress || []);
+      renderLastResult(data);
+      if (st === 'running') { if (stopButton) stopButton.disabled = false; if (submitButton) { submitButton.disabled = true; submitButton.textContent = 'در حال اجرا...'; } }
+      else { if (stopButton) stopButton.disabled = true; if (submitButton) { submitButton.disabled = false; submitButton.textContent = 'اجرای درخواست'; } }
+    }).catch(function(){ setConn(false); });
+  }
+
+  var lastHistoryId = -1;
+  function pollChatHistory(force) {
+    fetch('/chat-history').then(function(r){ return r.json(); }).then(function(data){
+      var history = data.history || [];
+      var lastId = history.length ? history[history.length-1].id : 0;
+      if (!force && lastId === lastHistoryId) return;
+      lastHistoryId = lastId; renderChatHistory(history);
+    }).catch(function(){});
+  }
+
+  var clearChatBtn = document.getElementById('clearChatBtn');
+  if (clearChatBtn) {
+    clearChatBtn.addEventListener('click', function() {
+      if (!confirm('پاک‌سازی تاریخچه چت؟')) return;
+      fetch('/clear-chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken } })
+        .then(function(r){ return r.json(); })
+        .then(function(){ lastHistoryId = -1; renderChatHistory([]); pollChatHistory(true); })
+        .catch(function(){});
+    });
+  }
+
+  pollStatus(); pollChatHistory();
+  setInterval(pollStatus, 2000); setInterval(pollChatHistory, 3000);
+})();
+</script>
+</body>
+</html>

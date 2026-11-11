@@ -1,6 +1,7 @@
 from flask import (
     Flask,
     request,
+    render_template,
     render_template_string,
     redirect,
     url_for,
@@ -2625,8 +2626,8 @@ def index():
 
     result = strip_think_tags(result)
 
-    return render_template_string(
-        HTML,
+    return render_template(
+        "index.html",
         projects=projects,
         result=result,
         request_text=request_text,
@@ -2829,8 +2830,8 @@ def rollback_route():
 
     result = strip_think_tags(result)
 
-    return render_template_string(
-        HTML,
+    return render_template(
+        "index.html",
         projects=projects,
         result=result,
         request_text=request_text,
@@ -3159,6 +3160,25 @@ def chat_history_route():
     )
 
 
+@app.route("/clear-chat", methods=["POST"])
+def clear_chat_route():
+    # پاک‌سازی تاریخچه گفتگو (SQLite) فقط در لایه web.
+    # هیچ تغییری در agent.py یا منطق اجرا ایجاد نمی‌شود.
+    with CHAT_DB_LOCK:
+        conn = sqlite3.connect(CHAT_DB_PATH)
+        try:
+            conn.execute("DELETE FROM chat_turns")
+            conn.commit()
+        finally:
+            conn.close()
+
+    return (
+        jsonify({"success": True}),
+        200,
+        {"Content-Type": "application/json"}
+    )
+
+
 if __name__ == "__main__":
 
     app.run(
@@ -3167,3 +3187,4 @@ if __name__ == "__main__":
         debug=False,
         threaded=True
     )
+
