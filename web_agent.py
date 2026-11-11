@@ -184,9 +184,83 @@ MODE_REVIEW = "read"
 MODE_APPLY = "write"
 
 
+def detect_project_from_request(user_request, projects):
+    """Detect project from prompt by project name or file/path hints.
+    Returns (project_name, error_message). error_message is non-empty when user must clarify."""
+    if not user_request:
+        return "general", ""
+
+    text = str(user_request)
+    text_lower = text.lower()
+    names = [n for n in (projects or {}).keys()]
+
+    # 1) Explicit project name mention
+    mentioned = []
+    for name in names:
+        if not name:
+            continue
+        if name.lower() in text_lower:
+            mentioned.append(name)
+    if len(mentioned) == 1:
+        return mentioned[0], ""
+    # 'general' can be mentioned but avoid forcing if other project also mentioned
+    if len(mentioned) > 1:
+        return "", "چند پروژه در درخواست ذکر شده است. لطفاً مشخص کنید منظورتان کدام پروژه است: " + "، ".join(mentioned)
+
+    # 2) Path-like tokens / filenames that exist in a project root
+    tokens = re.findall(r"[A-Za-z0-9_\-./\\\\]+\.[A-Za-z0-9_]+|[A-Za-z]:\\\\[^\s\"'<>|]+|(?:\.{0,2}[\\/])?[A-Za-z0-9_\-]+(?:[\\/][A-Za-z0-9_\-.]+)+", text)
+    matched_projects = set()
+    for name, root in (projects or {}).items():
+        if not root:
+            continue
+        try:
+            root_abs = os.path.abspath(root)
+        except Exception:
+            continue
+        for tok in tokens:
+            norm = tok.strip().strip('"\'`').replace('/', os.sep).replace('\\', os.sep)
+            if not norm:
+                continue
+            # try as relative path inside project
+            candidates = []
+            if os.path.isabs(norm) or (len(norm) > 1 and norm[1] == ':'):
+                candidates.append(os.path.normpath(norm))
+            candidates.append(os.path.normpath(os.path.join(root_abs, norm)))
+            for c in candidates:
+                try:
+                    if os.path.exists(c):
+                        # ensure inside this root when absolute-ish match
+                        try:
+                            if os.path.commonpath([os.path.abspath(c), root_abs]) == root_abs:
+                                matched_projects.add(name)
+                        except Exception:
+                            matched_projects.add(name)
+                except Exception:
+                    pass
+    matched_projects = [p for p in matched_projects if p in projects]
+    if len(matched_projects) == 1:
+        return matched_projects[0], ""
+    if len(matched_projects) > 1:
+        return "", "فایل/مسیر ذکرشده در چند پروژه یافت شد. لطفاً مشخص کنید منظورتان کدام پروژه است: " + "، ".join(sorted(matched_projects))
+
+    # 3) Fallbacks
+    non_general = [n for n in names if n != "general"]
+    if len(non_general) == 1:
+        return non_general[0], ""
+    if len(names) == 1:
+        return names[0], ""
+    if len(non_general) == 0:
+        return "general", ""
+
+    return "", "کدام پروژه مدنظر است؟ لطفاً نام پروژه را در درخواست ذکر کنید (" + "، ".join(non_general) + ")."
+
+
 def resolve_allow_write(mode):
     # Fail-Closed: فقط mode == "write" مجوز Apply است.
     return mode == MODE_APPLY
+
+
+
 
 
 # ---------------------------------------------------------
@@ -2426,7 +2500,7 @@ def index():
 
     result = ""
     request_text = ""
-    project_name = next(iter(projects))
+    project_name = next(iter(projects)) if projects else "general"
     mode = "read"
     running = False
     diff_text = ""
@@ -2487,7 +2561,7 @@ def index():
         project_name = request.form.get(
             "project",
             project_name
-        )
+        ).strip() or project_name
 
         mode = request.form.get(
             "mode",
@@ -2580,45 +2654,56 @@ def index():
 
             else:
 
-                # گزارش مرحله‌ای هر درخواست از صفر.
-                del agent_progress[:]
-                last_result = ""
+                # تشخیص خودکار پروژه از روی درخواست (بدون انتخاب دستی در UI)
+                detected_project, detect_error = detect_project_from_request(request_text, projects)
+                if detect_error:
+                    project_name = project_name or (next(iter(projects)) if projects else "general")
+                    result = detect_error
+                    file_plan = None
+                else:
+                    project_name = detected_project
 
-                allow_write = resolve_allow_write(mode)
+                if not detect_error:
 
-                stop_event = threading.Event()
-                current_stop_event = stop_event
+                    # گزارش مرحله‌ای هر درخواست از صفر.
+                    del agent_progress[:]
+                    last_result = ""
 
-                set_agent_status(
-                    AGENT_STATUS_RUNNING,
-                    "در حال اجرای درخواست...",
-                )
+                    allow_write = resolve_allow_write(mode)
 
-                agent_thread = threading.Thread(
-                    target=run_agent_background,
-                    args=(request_text,),
-                    kwargs={
-                        "project_name": project_name,
-                        "allow_write": allow_write,
-                        "stop_event": stop_event,
-                        "session_id": session_id,
-                    },
-                    daemon=True,
-                )
+                    stop_event = threading.Event()
+                    current_stop_event = stop_event
 
-                agent_thread.start()
+                    set_agent_status(
+                        AGENT_STATUS_RUNNING,
+                        "در حال اجرای درخواست...",
+                    )
 
-                running = True
+                    agent_thread = threading.Thread(
+                        target=run_agent_background,
+                        args=(request_text,),
+                        kwargs={
+                            "project_name": project_name,
+                            "allow_write": allow_write,
+                            "stop_event": stop_event,
+                            "session_id": session_id,
+                        },
+                        daemon=True,
+                    )
 
-                # درخواست پیش‌تر به thread و تاریخچه تحویل
-                # شده است؛ مقدار باقیمانده فقط برای رندر
-                # دوباره است، پس کادر ورودی برای درخواست بعدی
-                # خالی می‌ماند. (Enter و رفتار فرم تغییری نمی‌کند.)
-                request_text = ""
+                    agent_thread.start()
 
-                # Diff/Plan/Validation در GET بعدی خوانده
-                # می‌شوند، نه در همین پاسخ.
-                file_plan = get_last_file_plan()
+                    running = True
+
+                    # درخواست پیش‌تر به thread و تاریخچه تحویل
+                    # شده است؛ مقدار باقیمانده فقط برای رندر
+                    # دوباره است، پس کادر ورودی برای درخواست بعدی
+                    # خالی می‌ماند. (Enter و رفتار فرم تغییری نمی‌کند.)
+                    request_text = ""
+
+                    # Diff/Plan/Validation در GET بعدی خوانده
+                    # می‌شوند، نه در همین پاسخ.
+                    file_plan = get_last_file_plan()
 
         else:
 

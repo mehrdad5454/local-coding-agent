@@ -14616,10 +14616,11 @@ def run_agent_legacy(
     if handled:
         return generic_result
 
-    requested_file = find_requested_file(
+    requested_files = find_requested_files(
         project_root,
         user_request
     )
+    requested_file = requested_files[0] if requested_files else None
 
     should_search = False
     if not requested_file:

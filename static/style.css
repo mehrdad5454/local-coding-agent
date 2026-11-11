@@ -106,7 +106,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
   margin: 0; padding: 8px 10px; text-align: center; border: 1px solid var(--border);
   border-radius: 8px; background: #1e1e1e; cursor: pointer; color: var(--muted);
 }
-.mode-option input:checked + label { border-color: var(--accent); color: #fff; background: #1f2a33; }
+.mode-option input:disabled + label {
+  opacity: 0.45;
+  cursor: not-allowed;
+  border-color: #2f2f2f;
+  color: #666;
+  background: #1a1a1a;
+}
 
 .status-line { font-size: 12px; color: var(--muted); margin: 6px 0; }
 .status-line .badge { margin-right: 6px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 11px; }
@@ -117,17 +123,80 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .status-idle { color: var(--muted); }
 
 .console-list { font-size: 12px; }
-.log-item { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: #1f1f1f; margin-bottom: 8px; }
-.log-title { color: #9cdcfe; font-weight: 600; margin-bottom: 2px; }
-.log-meta { color: var(--muted); font-size: 11px; }
-.log-ok { border-left: 3px solid #3fb950; }
-.log-bad { border-left: 3px solid #d16d6d; }
-.log-wait { border-left: 3px solid #cca700; }
+.log-item { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: #202020; margin-bottom: 8px; }
+.log-title { color: #e6e6e6; font-weight: 500; margin-bottom: 2px; display: flex; align-items: center; gap: 8px; }
+.log-icon { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; background: #2a2a2a; color: #9cdcfe; font-size: 11px; flex: 0 0 auto; }
+.log-meta { color: var(--muted); font-size: 11px; margin-right: 26px; direction: ltr; text-align: left; }
+.log-ok, .step-ok { border-left: 3px solid #3fb950; }
+.log-bad, .step-bad { border-left: 3px solid #d16d6d; }
+.log-wait, .step-wait { border-left: 3px solid #cca700; }
+.step-start { border-left: 3px solid #4a4a4a; }
+.step-decision { border-left: 3px solid var(--accent); }
+.step-ok .log-icon { color: #3fb950; }
+.step-bad .log-icon { color: #d16d6d; }
+.step-wait .log-icon { color: #cca700; }
+.step-decision .log-icon { color: var(--accent); }
+
+.thinking { background: #222222; }
+.thinking-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.muted { color: var(--muted); font-size: 12px; }
+.thinking-dots { display: inline-flex; gap: 6px; align-items: center; height: 16px; padding: 2px 0; }
+.thinking-dots span {
+  width: 6px; height: 6px; border-radius: 50%; background: #8a8a8a;
+  animation: think-bounce 1.2s infinite ease-in-out;
+}
+.thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes think-bounce {
+  0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-3px); background: #cfcfcf; }
+}
 
 .settings-panel { display: none; margin-top: 8px; }
 .settings-panel.open { display: block; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .settings-grid .full { grid-column: 1 / -1; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+.modal-overlay.hidden { display: none; }
+.modal {
+  background: #252526;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: min(560px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.modal-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-header h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+}
+.modal-body { padding: 14px 16px; }
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: #232324;
+  border-radius: 0 0 12px 12px;
+}
 
 .approval-box, .diff-box, .validation-box, .rollback-box, .plan-box { margin-bottom: 10px; }
 .note { color: var(--muted); font-size: 11px; margin-top: 6px; }

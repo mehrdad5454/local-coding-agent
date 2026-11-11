@@ -18,7 +18,7 @@
     </div>
     <div class="topbar-right">
       <button type="button" class="btn ghost" id="clearChatBtn">Clear Chat</button>
-      <button type="button" class="btn ghost" id="settingsToggle">تنظیمات</button>
+      <button type="button" class="btn ghost" id="settingsToggle">⚙️ تنظیمات</button>
     </div>
   </header>
 
@@ -30,6 +30,11 @@
         <div id="statusBanner" class="status-line status-{{ status_class|default('idle') }}">
           <span id="statusMsg">{{ status_text|default('آماده') }}</span>
           {% if status_badge %}<span class="badge" id="statusBadge">{{ status_badge }}</span>{% endif %}
+        </div>
+
+        <div id="thinkingIndicator" class="card thinking hidden" aria-live="polite">
+          <div class="thinking-row"><span class="role agent">Agent</span><span class="muted">در حال فکر کردن</span></div>
+          <div class="thinking-dots"><span></span><span></span><span></span></div>
         </div>
 
         <div id="chatHistoryBox" class="chat-history-box">
@@ -115,60 +120,53 @@
         <form method="post" id="agentForm" action="/">
           <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
           <input type="hidden" name="session_id" value="{{ session_id }}">
+          <input type="hidden" id="projectHidden" name="project" value="{{ project_name|e }}">
 
-          <div class="row" style="margin-bottom:8px;">
-            <div>
-              <label for="project">پروژه</label>
-              <select id="project" name="project">
-                <option value="general" {% if project_name == "general" %}selected{% endif %}>General / بدون پروژه</option>
-                {% for name in projects %}
-                <option value="{{ name }}" {% if project_name == name %}selected{% endif %}>{{ name }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="shrink" style="align-self:flex-end; display:flex; gap:6px;">
-              <button type="submit" formaction="/add-project" formmethod="post" class="btn" title="افزودن پروژه">+</button>
-              {% if project_name != "agent-test" and project_name != "general" %}
-              <button type="submit" formaction="/remove-project" formmethod="post" name="name" value="{{ project_name|e }}" class="btn" title="حذف پروژه">حذف</button>
-              {% endif %}
-            </div>
-          </div>
-
-          <div class="mode-options">
+          <div class="mode-options" id="modeOptions">
             <div class="mode-option"><input type="radio" id="read" name="mode" value="read" {% if mode != "write" %}checked{% endif %}><label for="read">فقط بررسی</label></div>
             <div class="mode-option"><input type="radio" id="write" name="mode" value="write" {% if mode == "write" %}checked{% endif %}><label for="write">اعمال تغییر</label></div>
           </div>
+          <div class="note" id="modeHint">حالت اجرا بر اساس درخواست تشخیص داده می‌شود.</div>
 
           <label for="request">درخواست</label>
-          <textarea id="request" name="request" placeholder="چه کاری انجام دهم؟">{{ request_text }}</textarea>
+          <textarea id="request" name="request" placeholder="چه کاری انجام دهم؟ (نام فایل/مسیر یا پروژه را در متن بنویسید)">{{ request_text }}</textarea>
           <div class="actions">
             <button type="submit" id="submitButton" class="btn primary">اجرای درخواست</button>
             <button type="button" id="stopButton" class="btn" disabled>توقف اجرا</button>
           </div>
 
-          <div id="settingsPanel" class="settings-panel">
-            <div class="settings-grid">
-              <div>
-                <label for="provider">Provider</label>
-                <select id="provider" name="provider">
-                  <option value="">پیش‌فرض</option>
-                  <option value="local">Local</option>
-                  <option value="openrouter">OpenRouter</option>
-                  <option value="groq">Groq</option>
-                  <option value="openai_compatible">OpenAI Compatible</option>
-                </select>
+          <div id="settingsModal" class="modal-overlay hidden" aria-hidden="true">
+            <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+              <div class="modal-header">
+                <h2 id="settingsTitle">تنظیمات</h2>
               </div>
-              <div>
-                <label for="model">Model</label>
-                <input type="text" id="model" name="model" placeholder="Model (optional)">
+              <div class="modal-body settings-grid">
+                <div>
+                  <label for="provider">Provider</label>
+                  <select id="provider" name="provider">
+                    <option value="">پیش‌فرض</option>
+                    <option value="local">Local</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="groq">Groq</option>
+                    <option value="openai_compatible">OpenAI Compatible</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="model">Model</label>
+                  <input type="text" id="model" name="model" placeholder="Model (optional)">
+                </div>
+                <div class="full">
+                  <label for="base_url">Base URL</label>
+                  <input type="text" id="base_url" name="base_url" placeholder="Base URL (optional)">
+                </div>
+                <div class="full">
+                  <label for="api_key">API Key</label>
+                  <input type="password" id="api_key" name="api_key" placeholder="API Key (optional)">
+                </div>
               </div>
-              <div class="full">
-                <label for="base_url">Base URL</label>
-                <input type="text" id="base_url" name="base_url" placeholder="Base URL (optional)">
-              </div>
-              <div class="full">
-                <label for="api_key">API Key</label>
-                <input type="password" id="api_key" name="api_key" placeholder="API Key (optional)">
+              <div class="modal-actions">
+                <button type="button" id="settingsSave" class="btn primary">ذخیره</button>
+                <button type="button" id="settingsClose" class="btn">بستن</button>
               </div>
             </div>
           </div>
@@ -195,41 +193,131 @@
   var submitButton = document.getElementById('submitButton');
   var stopButton = document.getElementById('stopButton');
   var settingsToggle = document.getElementById('settingsToggle');
-  var settingsPanel = document.getElementById('settingsPanel');
+  var settingsModal = document.getElementById('settingsModal');
+  var settingsClose = document.getElementById('settingsClose');
+  var settingsSave = document.getElementById('settingsSave');
   var connDot = document.getElementById('connDot');
   var connText = document.getElementById('connText');
   var statusMsg = document.getElementById('statusMsg');
   var csrfToken = "{{ csrf_token }}";
 
-  if (settingsToggle && settingsPanel) {
-    settingsToggle.addEventListener('click', function() {
-      settingsPanel.classList.toggle('open');
-    });
+  var settingsFields = {
+    provider: document.getElementById('provider'),
+    model: document.getElementById('model'),
+    base_url: document.getElementById('base_url'),
+    api_key: document.getElementById('api_key')
+  };
+  var SETTINGS_KEY = 'local_agent_settings_v1';
+
+  function loadSettings() {
+    try {
+      var raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return;
+      var data = JSON.parse(raw) || {};
+      Object.keys(settingsFields).forEach(function(k) {
+        if (settingsFields[k] && typeof data[k] === 'string') settingsFields[k].value = data[k];
+      });
+    } catch (e) {}
+  }
+  function saveSettings() {
+    try {
+      var data = {};
+      Object.keys(settingsFields).forEach(function(k) {
+        data[k] = settingsFields[k] ? settingsFields[k].value : '';
+      });
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
+    } catch (e) {}
+  }
+  function openSettings() {
+    if (!settingsModal) return;
+    settingsModal.classList.remove('hidden');
+    settingsModal.setAttribute('aria-hidden', 'false');
+  }
+  function closeSettings() {
+    if (!settingsModal) return;
+    settingsModal.classList.add('hidden');
+    settingsModal.setAttribute('aria-hidden', 'true');
+  }
+  if (settingsToggle) settingsToggle.addEventListener('click', openSettings);
+  if (settingsClose) settingsClose.addEventListener('click', closeSettings);
+  if (settingsSave) settingsSave.addEventListener('click', function() { saveSettings(); closeSettings(); });
+  if (settingsModal) {
+    settingsModal.addEventListener('click', function(e) { if (e.target === settingsModal) closeSettings(); });
+  }
+  Object.keys(settingsFields).forEach(function(k) {
+    if (settingsFields[k]) settingsFields[k].addEventListener('change', saveSettings);
+  });
+  loadSettings();
+
+  function setThinking(on) {
+    var el = document.getElementById('thinkingIndicator');
+    if (!el) return;
+    if (on) { el.classList.remove('hidden'); var sc = document.getElementById('chatScroll'); if (sc) sc.scrollTop = sc.scrollHeight; }
+    else { el.classList.add('hidden'); }
   }
 
   if (form && submitButton) {
     form.addEventListener('submit', function(e) {
-      if (e.submitter && e.submitter.formAction && e.submitter.formAction.indexOf('/add-project') === -1 && e.submitter.formAction.indexOf('/remove-project') === -1) {
+      var isMain = !e.submitter || e.submitter.id === 'submitButton';
+      var isProjectOp = e.submitter && e.submitter.formAction && (e.submitter.formAction.indexOf('/add-project') !== -1 || e.submitter.formAction.indexOf('/remove-project') !== -1);
+      if (isMain && !isProjectOp) {
         submitButton.disabled = true;
         submitButton.textContent = 'در حال اجرا...';
         if (stopButton) stopButton.disabled = false;
-      }
-      if (!e.submitter || e.submitter.id === 'submitButton') {
-        submitButton.disabled = true;
-        submitButton.textContent = 'در حال اجرا...';
-        if (stopButton) stopButton.disabled = false;
+        setThinking(true);
       }
     });
   }
 
   var requestEl = document.getElementById('request');
-  if (requestEl && form) {
+  var readRadio = document.getElementById('read');
+  var writeRadio = document.getElementById('write');
+  var modeHint = document.getElementById('modeHint');
+
+  function detectIntent(text) {
+    var t = (text || '').toLower();
+    var writeRe = /(بنویس|ایجاد|بساز|اضافه|ویرایش|تغییر|اصلاح|حذف|پاک|rename|refactor|fix|update|create|write|add|remove|delete|edit|modify|patch|replace|commit)/i;
+    var readRe = /(بخوان|بررسی|چک|نمایش|نشان|لیست|جستجو|پیدا|توضیح|تحلیل|خواندن|review|read|show|list|find|search|explain|inspect|check|analyz)/i;
+    return { write: writeRe.test(t), read: readRe.test(t) };
+  }
+  function updateModeUI() {
+    if (!readRadio || !writeRadio) return;
+    var text = requestEl ? requestEl.value : '';
+    if (!text || !text.trim()) {
+      readRadio.disabled = true; writeRadio.disabled = true;
+      readRadio.checked = false; writeRadio.checked = false;
+      if (modeHint) modeHint.textContent = 'برای فعال شدن حالت‌ها، درخواست خود را بنویسید.';
+      return;
+    }
+    var intent = detectIntent(text);
+    var hasWrite = intent.write;
+    var hasRead = intent.read || !hasWrite; // default to read/review when ambiguous
+    readRadio.disabled = !hasRead;
+    writeRadio.disabled = !hasWrite;
+    if (hasWrite && !hasRead) { writeRadio.checked = true; }
+    else if (hasRead && !hasWrite) { readRadio.checked = true; }
+    else if (hasWrite && hasRead) {
+      if (!readRadio.checked && !writeRadio.checked) readRadio.checked = true;
+      if (readRadio.checked && readRadio.disabled) writeRadio.checked = true;
+      if (writeRadio.checked && writeRadio.disabled) readRadio.checked = true;
+    } else {
+      readRadio.checked = true; readRadio.disabled = false; writeRadio.disabled = true;
+    }
+    if (modeHint) {
+      if (hasWrite && hasRead) modeHint.textContent = 'هم بررسی و هم تغییر تشخیص داده شد؛ حالت مناسب را انتخاب کنید.';
+      else if (hasWrite) modeHint.textContent = 'درخواست تغییردهنده تشخیص داده شد: «اعمال تغییر» فعال است.';
+      else modeHint.textContent = 'درخواست بررسی/خواندن تشخیص داده شد: «فقط بررسی» فعال است.';
+    }
+  }
+  if (requestEl) {
+    requestEl.addEventListener('input', updateModeUI);
     requestEl.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
         if (this.value.trim()) { e.preventDefault(); form.requestSubmit(); }
       }
     });
   }
+  updateModeUI();
 
   function setConn(ok) {
     if (!connDot || !connText) return;
@@ -250,6 +338,19 @@
     return map[state] || state || '';
   }
 
+  function describeStep(ev) {
+    var d = ev.data || {};
+    var step = d.step ? ('گام ' + d.step) : '';
+    if (ev.event === 'step_start') return { icon: '●', cls: 'step-start', title: step + ' — شروع', meta: d.max_steps ? ('سقف گام‌ها: ' + d.max_steps) : '' };
+    if (ev.event === 'decision') {
+      if (d.tool) return { icon: '◆', cls: 'step-decision', title: step + ' — انتخاب ابزار', meta: d.tool };
+      return { icon: '◆', cls: 'step-decision', title: step + ' — تولید پاسخ', meta: '' };
+    }
+    if (ev.event === 'tool_done') return { icon: d.ok ? '✓' : '✗', cls: d.ok ? 'step-ok' : 'step-bad', title: step + ' — ' + (d.ok ? 'موفق' : 'ناموفق'), meta: d.tool || '' };
+    if (ev.event === 'awaiting_approval') return { icon: '⏳', cls: 'step-wait', title: step + ' — منتظر تأیید', meta: d.tool || '' };
+    return { icon: '•', cls: '', title: step ? (step + ' — ' + ev.event) : ev.event, meta: JSON.stringify(d) };
+  }
+
   function renderProgress(events) {
     var wrap = document.getElementById('progressBox');
     var list = document.getElementById('progressList');
@@ -258,22 +359,19 @@
     list.innerHTML = '';
     if (!events || !events.length) { wrap.classList.add('hidden'); if (hint) hint.style.display=''; return; }
     wrap.classList.remove('hidden'); if (hint) hint.style.display='none';
-    events.slice(-40).forEach(function(ev) {
-      var d = ev.data || {};
+    events.slice(-60).forEach(function(ev) {
+      var info = describeStep(ev);
       var item = document.createElement('div');
-      var cls = 'log-item';
-      if (ev.event === 'tool_done') cls += d.ok ? ' log-ok' : ' log-bad';
-      else if (ev.event === 'awaiting_approval') cls += ' log-wait';
-      item.className = cls;
-      var title = document.createElement('div'); title.className='log-title';
-      title.textContent = (ev.event || 'event') + (d.step ? (' • گام ' + d.step) : '');
-      var meta = document.createElement('div'); meta.className='log-meta prewrap';
-      var parts = [];
-      if (d.tool) parts.push('tool: ' + d.tool);
-      if (d.max_steps) parts.push('max_steps: ' + d.max_steps);
-      if (ev.event === 'tool_done') parts.push(d.ok ? 'ok' : 'failed');
-      meta.textContent = parts.join(' | ') || JSON.stringify(d);
-      item.appendChild(title); item.appendChild(meta);
+      item.className = 'log-item ' + (info.cls || '');
+      var title = document.createElement('div'); title.className = 'log-title';
+      var icon = document.createElement('span'); icon.className = 'log-icon'; icon.textContent = info.icon;
+      var txt = document.createElement('span'); txt.textContent = info.title;
+      title.appendChild(icon); title.appendChild(txt);
+      item.appendChild(title);
+      if (info.meta) {
+        var meta = document.createElement('div'); meta.className = 'log-meta prewrap'; meta.textContent = info.meta;
+        item.appendChild(meta);
+      }
       list.appendChild(item);
     });
     var pb = wrap.parentElement; if (pb) pb.scrollTop = pb.scrollHeight;
@@ -336,8 +434,8 @@
       if (banner) banner.className = 'status-line status-' + st;
       renderProgress(data.progress || []);
       renderLastResult(data);
-      if (st === 'running') { if (stopButton) stopButton.disabled = false; if (submitButton) { submitButton.disabled = true; submitButton.textContent = 'در حال اجرا...'; } }
-      else { if (stopButton) stopButton.disabled = true; if (submitButton) { submitButton.disabled = false; submitButton.textContent = 'اجرای درخواست'; } }
+      if (st === 'running') { setThinking(true); if (stopButton) stopButton.disabled = false; if (submitButton) { submitButton.disabled = true; submitButton.textContent = 'در حال اجرا...'; } }
+      else { setThinking(false); if (stopButton) stopButton.disabled = true; if (submitButton) { submitButton.disabled = false; submitButton.textContent = 'اجرای درخواست'; } }
     }).catch(function(){ setConn(false); });
   }
 
