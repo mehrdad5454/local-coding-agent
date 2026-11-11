@@ -1,6 +1,8 @@
 import os, re, fnmatch, difflib, shutil, tempfile, time
 from pathlib import Path
 
+from agents.core_utils import *
+
 # State/results (kept compatible with previous agent.py globals)
 LAST_WRITE_RESULT = None
 LAST_WRITE_MULTI_RESULT = None
@@ -87,8 +89,7 @@ def _get_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 def read_file(project_root, relative_path):
-    import agent as core
-    full_path = core.safe_path(project_root, relative_path)
+    full_path = safe_path(project_root, relative_path)
     if not os.path.isfile(full_path):
         raise FileNotFoundError(f"File not found: {relative_path}")
     with open(full_path, "r", encoding="utf-8") as f:
@@ -113,17 +114,16 @@ def create_backup(project_root, full_path):
     return backup_path
 
 def write_file(project_root, relative_path, content, return_details=False, create_parents=False, action_type="write"):
-    import agent as core
-    if core.is_stop_requested():
-        core.remember_stop_blocked_action(
+    if is_stop_requested():
+        remember_stop_blocked_action(
             tool=("edit_file" if action_type == "edit" else "write_file"),
             action_type=action_type,
             args={"path": relative_path, "content": content},
             project_root=project_root,
             target=relative_path,
         )
-        raise RuntimeError(core.EMERGENCY_STOP_MESSAGE)
-    full_path = core.safe_path(project_root, relative_path)
+        raise RuntimeError(EMERGENCY_STOP_MESSAGE)
+    full_path = safe_path(project_root, relative_path)
     parent = os.path.dirname(full_path)
     if not os.path.isdir(parent):
         if not create_parents:
@@ -133,12 +133,12 @@ def write_file(project_root, relative_path, content, return_details=False, creat
             raise ValueError("Path is outside the selected project.")
     existed_before = os.path.isfile(full_path)
     diff = compute_write_diff(full_path, relative_path, content)
-    before_state = core.build_action_before_state(full_path)
+    before_state = build_action_before_state(full_path)
     backup_path = create_backup(project_root, full_path)
     with open(full_path, "w", encoding="utf-8", newline="") as f:
         f.write(content)
     try:
-        validation = core.validate_written_file(project_root, relative_path, content, full_path)
+        validation = validate_written_file(project_root, relative_path, content, full_path)
     except Exception as e:
         validation = {
             "valid": False, "exists": os.path.isfile(full_path), "size": None,
@@ -150,33 +150,32 @@ def write_file(project_root, relative_path, content, return_details=False, creat
         "backup_path": backup_path, "existed_before": existed_before, "diff": diff,
         "changed": (not existed_before or bool(diff)), "validation": validation
     })
-    core.record_action(
+    record_action(
         action_type=action_type,
         tool=("edit_file" if action_type == "edit" else "write_file"),
         args={"path": relative_path, "content": content},
         project_root=project_root, target=relative_path,
         validation_state=validation.get("valid"), backup_path=backup_path,
-        before_state=before_state, execution_state=core.ACTION_STATE_DONE,
-        verify_state=core.verify_state_from_bool(validation.get("valid")),
-        result_summary=core.summarize_action_result(core.summarize_validation(validation)),
+        before_state=before_state, execution_state=ACTION_STATE_DONE,
+        verify_state=verify_state_from_bool(validation.get("valid")),
+        result_summary=summarize_action_result(summarize_validation(validation)),
     )
     if return_details:
         return get_last_write_result()
     return full_path
 
 def write_file_multi(project_root, files, return_details=False):
-    import agent as core
     files = files or []
     root = os.path.abspath(project_root)
     if not os.path.isdir(root):
         raise ValueError("پوشه پروژه پیدا نشد:\n" + project_root)
-    if core.is_stop_requested():
-        core.remember_stop_blocked_action(
+    if is_stop_requested():
+        remember_stop_blocked_action(
             tool="write_file_multi", action_type="multi_write",
             args={"paths": [item.get("relative_path") or item.get("path") for item in files if isinstance(item, dict)]},
             project_root=root,
         )
-        raise RuntimeError(core.EMERGENCY_STOP_MESSAGE)
+        raise RuntimeError(EMERGENCY_STOP_MESSAGE)
     multi_root = os.path.join(root, MULTI_BACKUP_DIRNAME)
     os.makedirs(multi_root, exist_ok=True)
     transaction_dir = tempfile.mkdtemp(prefix="mfp_", dir=multi_root)
@@ -194,12 +193,12 @@ def write_file_multi(project_root, files, return_details=False):
             action = file_item.get("action", "")
             if not relative_path:
                 raise ValueError("هر فایل باید دارای relative_path یا path باشد.")
-            full_path = core.safe_path(root, relative_path)
+            full_path = safe_path(root, relative_path)
             resolved_path = os.path.realpath(full_path)
             resolved_root = os.path.realpath(root)
             if os.path.commonpath([resolved_path, resolved_root]) != resolved_root:
                 raise ValueError("Path is outside the selected project.")
-            core.ensure_write_target_is_not_directory(full_path, relative_path)
+            ensure_write_target_is_not_directory(full_path, relative_path)
             existed_before = os.path.isfile(full_path)
             undo_backup_path = create_backup(root, full_path)
             if not action:
@@ -237,7 +236,7 @@ def write_file_multi(project_root, files, return_details=False):
                 "existed_before": existed_before
             })
             try:
-                validation = core.validate_written_file(root, relative_path, content, full_path)
+                validation = validate_written_file(root, relative_path, content, full_path)
             except Exception as e:
                 validation = {
                     "valid": False, "exists": os.path.isfile(full_path), "size": None,
@@ -303,16 +302,15 @@ def search_subfolders(project_root, filename):
     return None
 
 def list_directory(project_root, relative_path=None, depth=1, include_ignored=False, max_entries=None):
-    import agent as core
     if max_entries is None:
-        max_entries = core.MAX_EXPLORE_ENTRIES
+        max_entries = MAX_EXPLORE_ENTRIES
     root = os.path.abspath(project_root)
     if not os.path.isdir(root):
         raise ValueError("پوشه پروژه پیدا نشد: " + str(project_root))
-    target = core.resolve_project_path(root, relative_path)
+    target = resolve_project_path(root, relative_path)
     if not os.path.isdir(target):
         raise ValueError("پوشه پیدا نشد: " + (str(relative_path) if relative_path else "."))
-    entries, truncated = core.scan_directory_entries(root, target, depth=depth, include_ignored=include_ignored, max_entries=max_entries)
+    entries, truncated = scan_directory_entries(root, target, depth=depth, include_ignored=include_ignored, max_entries=max_entries)
     lines = []
     for entry in entries:
         indent = "  " * entry["depth"]
@@ -328,27 +326,26 @@ def list_directory(project_root, relative_path=None, depth=1, include_ignored=Fa
         lines.append("(پوشه خالی است)")
     if truncated:
         lines.append("(... فهرست کامل نمایش داده نشد)")
-    return {"path": core.relative_display(root, target), "full_path": target, "exists": True, "is_dir": True, "entries": entries, "count": len(entries), "truncated": truncated, "text": "\n".join(lines)}
+    return {"path": relative_display(root, target), "full_path": target, "exists": True, "is_dir": True, "entries": entries, "count": len(entries), "truncated": truncated, "text": "\n".join(lines)}
 
 def search_in_files(project_root, query, subdir=None, max_results=None, case_sensitive=False, max_file_bytes=None):
-    import agent as core
     if max_results is None:
-        max_results = core.MAX_SEARCH_RESULTS
+        max_results = MAX_SEARCH_RESULTS
     if max_file_bytes is None:
-        max_file_bytes = core.MAX_SEARCH_FILE_BYTES
+        max_file_bytes = MAX_SEARCH_FILE_BYTES
     root = os.path.abspath(project_root)
     if not os.path.isdir(root):
         raise ValueError("پوشه پروژه پیدا نشد: " + str(project_root))
     needle = "" if query is None else str(query)
     if not needle.strip():
         raise ValueError("عبارت جستجو خالی است.")
-    start = core.resolve_project_path(root, subdir) if subdir else root
+    start = resolve_project_path(root, subdir) if subdir else root
     if os.path.isfile(start):
         files = [start]
     elif os.path.isdir(start):
         files = []
         for dir_path, dir_names, file_names in os.walk(start):
-            dir_names[:] = [item for item in dir_names if item not in core.IGNORED_DIR_NAMES]
+            dir_names[:] = [item for item in dir_names if item not in IGNORED_DIR_NAMES]
             for item in sorted(file_names):
                 files.append(os.path.join(dir_path, item))
     else:
@@ -356,9 +353,9 @@ def search_in_files(project_root, query, subdir=None, max_results=None, case_sen
     haystack_needle = needle if case_sensitive else needle.lower()
     results = []
     for full_path in files:
-        if core.is_sensitive_read_target(core.relative_display(root, full_path)):
+        if is_sensitive_read_target(relative_display(root, full_path)):
             continue
-        if not core.is_probably_text_file(full_path):
+        if not is_probably_text_file(full_path):
             continue
         try:
             if os.path.getsize(full_path) > max_file_bytes:
@@ -375,18 +372,17 @@ def search_in_files(project_root, query, subdir=None, max_results=None, case_sen
             if haystack_needle not in haystack:
                 continue
             results.append({
-                "relative_path": core.relative_display(root, full_path),
+                "relative_path": relative_display(root, full_path),
                 "line": line_number,
-                "text": core.mask_sensitive_content(line.strip()[:200]),
+                "text": mask_sensitive_content(line.strip()[:200]),
             })
             if len(results) >= max_results:
                 return results
     return results
 
 def read_files_multi(project_root, relative_paths, max_bytes=None):
-    import agent as core
     if max_bytes is None:
-        max_bytes = core.MAX_TEXT_READ_BYTES
+        max_bytes = MAX_TEXT_READ_BYTES
     root = os.path.abspath(project_root)
     results = []
     for relative_path in relative_paths or []:
@@ -395,12 +391,12 @@ def read_files_multi(project_root, relative_paths, max_bytes=None):
             "full_path": None, "content": None, "size": None,
             "truncated": False, "error": None,
         }
-        if core.is_sensitive_read_target(relative_path):
-            item["error"] = core.sensitive_read_refusal_text(relative_path)
+        if is_sensitive_read_target(relative_path):
+            item["error"] = sensitive_read_refusal_text(relative_path)
             results.append(item)
             continue
         try:
-            full_path = core.resolve_project_path(root, relative_path)
+            full_path = resolve_project_path(root, relative_path)
             if not os.path.isfile(full_path):
                 raise FileNotFoundError("فایل پیدا نشد: " + str(relative_path))
             item["full_path"] = full_path
@@ -417,12 +413,11 @@ def read_files_multi(project_root, relative_paths, max_bytes=None):
     return results
 
 def edit_file(project_root, relative_path, old_text, new_text, replace_all=False, return_details=False):
-    import agent as core
     if not old_text:
         raise ValueError("متن موردنظر برای ویرایش خالی است.")
     root = os.path.abspath(project_root)
-    full_path = core.safe_path(root, relative_path)
-    if not core.is_inside_project(root, full_path):
+    full_path = safe_path(root, relative_path)
+    if not is_inside_project(root, full_path):
         raise ValueError("مسیر خارج از پروژه انتخاب‌شده است.")
     if not os.path.isfile(full_path):
         raise FileNotFoundError("فایل پیدا نشد: " + str(relative_path))

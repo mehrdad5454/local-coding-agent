@@ -21,6 +21,8 @@ except Exception:
     _phase_g_analyze = None
     _phase_g_format = None
 
+from agents.core_utils import *
+
 # Extracted file tools (read/write/edit/list/search/backup)
 from agents.tools.file_tools import *
 
