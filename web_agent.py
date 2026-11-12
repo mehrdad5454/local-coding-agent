@@ -194,16 +194,19 @@ def detect_project_from_request(user_request, projects):
     text_lower = text.lower()
     names = [n for n in (projects or {}).keys()]
 
-    # 1) Explicit project name mention
+    # 1) Explicit project name mention — use word-boundary matching so
+    # that "agent" inside "agent-test" or "local-agent" does NOT count
+    # as a mention of those project names. Only the full project name
+    # appearing as a standalone token counts.
     mentioned = []
     for name in names:
         if not name:
             continue
-        if name.lower() in text_lower:
+        pattern = re.escape(name.lower())
+        if re.search(r'(?<![A-Za-z0-9_\-])' + pattern + r'(?![A-Za-z0-9_\-])', text_lower):
             mentioned.append(name)
     if len(mentioned) == 1:
         return mentioned[0], ""
-    # 'general' can be mentioned but avoid forcing if other project also mentioned
     if len(mentioned) > 1:
         return "", "چند پروژه در درخواست ذکر شده است. لطفاً مشخص کنید منظورتان کدام پروژه است: " + "، ".join(mentioned)
 
@@ -2655,7 +2658,15 @@ def index():
             else:
 
                 # تشخیص خودکار پروژه از روی درخواست (بدون انتخاب دستی در UI)
-                detected_project, detect_error = detect_project_from_request(request_text, projects)
+                # اگر کاربر صراحتاً پروژه را در فرم انتخاب کرده، از آن استفاده
+                # می‌کنیم و تشخیص خودکار را Skip می‌کنیم تا درخواست‌هایی
+                # که نام پروژه را ذکر نکرده‌اند (مثلاً «فایل agent.py رو بخون»)
+                # با خطای «کدام پروژه؟» م-face نشوند.
+                if project_name and project_name in projects:
+                    detected_project = project_name
+                    detect_error = ""
+                else:
+                    detected_project, detect_error = detect_project_from_request(request_text, projects)
                 if detect_error:
                     project_name = project_name or (next(iter(projects)) if projects else "general")
                     result = detect_error

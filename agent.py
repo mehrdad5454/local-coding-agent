@@ -8449,7 +8449,19 @@ def tool_read_file(project_root, args):
         args, "path", "relative_path", "file", "filename", "name"
     )
 
-    if not path:
+    # Normalize dict/list path arguments (model sometimes emits
+    # {"path": "..."} instead of a bare string).
+    if isinstance(path, dict):
+        for key in ("path", "relative_path", "file", "filename", "name"):
+            if key in path and path[key] not in (None, ""):
+                path = path[key]
+                break
+        else:
+            path = None
+    elif isinstance(path, (list, tuple)):
+        path = path[0] if path else None
+
+    if not path or not isinstance(path, str):
         return tool_fail("آرگومان path لازم است.")
 
     # Phase H — Security Boundary. قبل از هر I/O بررسی

@@ -88,7 +88,28 @@ def _rollback_multi_file(project_root, written_entries):
 def _get_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
+def _normalize_path_arg(value):
+    """Normalize a path argument that may arrive as a dict, list, or string."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("path", "relative_path", "file", "filename", "name"):
+            if key in value and value[key] not in (None, ""):
+                return value[key]
+        return None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return _normalize_path_arg(value[0])
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def read_file(project_root, relative_path):
+    relative_path = _normalize_path_arg(relative_path)
+    if not relative_path or not isinstance(relative_path, str):
+        raise ValueError("Invalid path argument for read_file: " + repr(relative_path))
     full_path = safe_path(project_root, relative_path)
     if not os.path.isfile(full_path):
         raise FileNotFoundError(f"File not found: {relative_path}")
@@ -385,7 +406,16 @@ def read_files_multi(project_root, relative_paths, max_bytes=None):
         max_bytes = MAX_TEXT_READ_BYTES
     root = os.path.abspath(project_root)
     results = []
-    for relative_path in relative_paths or []:
+    for raw_path in relative_paths or []:
+        relative_path = _normalize_path_arg(raw_path)
+        if not relative_path or not isinstance(relative_path, str):
+            results.append({
+                "relative_path": str(raw_path),
+                "full_path": None, "content": None, "size": None,
+                "truncated": False,
+                "error": "Invalid path argument: " + repr(raw_path),
+            })
+            continue
         item = {
             "relative_path": str(relative_path).replace(os.sep, "/"),
             "full_path": None, "content": None, "size": None,
