@@ -347,6 +347,28 @@ def get_project_path(project_name):
     return projects.get(project_name)
 
 
+def _suggest_project_for_file(relative_path):
+    """When a file read fails, scan other projects for the same relative
+    path and return the name of the first project that has it."""
+    if not relative_path:
+        return None
+    try:
+        projects = load_projects()
+    except Exception:
+        return None
+    norm = str(relative_path).replace("\\", "/").strip().lstrip("/")
+    for name, root in projects.items():
+        if not root:
+            continue
+        try:
+            full = os.path.abspath(os.path.join(root, norm))
+            if os.path.isfile(full):
+                return name
+        except Exception:
+            continue
+    return None
+
+
 def add_project(project_name, project_path):
     projects = load_projects()
 
@@ -14870,10 +14892,19 @@ REAL PROJECT STRUCTURE (root level):
         )
 
     except Exception as e:
-        return (
+        # Build a helpful error that suggests other projects containing
+        # the same file, so the user can switch projects easily.
+        suggestion = _suggest_project_for_file(requested_file)
+        msg = (
             "خطا در خواندن فایل:\n"
             + str(e)
         )
+        if suggestion:
+            msg += (
+                "\n\nآیا منظور شما پروژه «" + suggestion
+                + "» بود؟ این فایل در آن پروژه یافت می‌شود."
+            )
+        return msg
 
     if not is_write_allowed(allow_write):
         # Mask فقط در مسیر Read-only اعمال می‌شود؛

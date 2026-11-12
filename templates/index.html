@@ -377,7 +377,7 @@
     var pb = wrap.parentElement; if (pb) pb.scrollTop = pb.scrollHeight;
   }
 
-  function renderChatHistory(history) {
+function renderChatHistory(history) {
     var list = document.getElementById('chatHistoryList');
     if (!list) return;
     list.innerHTML = '';
@@ -389,6 +389,12 @@
       var arole = document.createElement('div'); arole.className='card-head'; arole.style.marginTop='8px';
       arole.innerHTML = '<span class="role agent">Agent</span><span>'+badgeLabel(item.state)+'</span>';
       var r = document.createElement('div'); r.className='prewrap'; r.textContent = item.response || '';
+      var copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'btn ghost shrink';
+      copyBtn.textContent = 'کپی';
+      copyBtn.addEventListener('click', function(){ copyText(r.textContent||'', copyBtn); });
+      arole.appendChild(copyBtn);
       wrap.appendChild(h); wrap.appendChild(p); wrap.appendChild(arole); wrap.appendChild(r);
       list.appendChild(wrap);
     });
