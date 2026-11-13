@@ -3,6 +3,10 @@
 __pycache__/
 *.py[cod]
 
+# Environment / secrets
+.env
+.env.*
+
 # Local runtime data
 action-journal.json
 chat-history.db
@@ -20,6 +24,7 @@ projects.json
 2000))
 out.txt
 .pytest_cache/
+tests_tmp/
 general_workspace/
 
 # IDE
