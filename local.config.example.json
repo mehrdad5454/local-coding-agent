@@ -1,0 +1,10 @@
+{
+  "LLAMA_SERVER_EXE": "C:\\path\\to\\llama-server.exe",
+  "MODEL_PATH": "C:\\path\\to\\model-Q4_K_M.gguf",
+  "MODEL_HOST": "127.0.0.1",
+  "MODEL_PORT": "8080",
+  "MODEL_CONTEXT": "8192",
+  "PYTHON_EXE": ".venv\\Scripts\\python.exe",
+  "WEB_PORT": "5000",
+  "OPEN_BROWSER": "1"
+}
