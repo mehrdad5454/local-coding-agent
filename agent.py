@@ -2826,6 +2826,21 @@ def extract_file_candidates(user_request):
     return candidates
 
 
+def format_search_results(results, query):
+    """Format search results into a readable Persian string.
+    Defined here so tool_search_in_files and handle_search_intent
+    never depend on web_research being importable."""
+    if not results:
+        return "هیچ نتیجه‌ای برای «" + str(query) + "» پیدا نشد."
+    lines = []
+    for item in results:
+        path = item.get("relative_path", "?")
+        line_no = item.get("line", "?")
+        text = item.get("text", "")
+        lines.append(str(path) + ":" + str(line_no) + ": " + text)
+    return "\n".join(lines)
+
+
 def find_requested_files(project_root, user_request):
     # تشخیص چند فایل موردنیاز درخواست.
     # خروجی ساختاریافته برای هر فایل:
@@ -2899,6 +2914,43 @@ def find_requested_files(project_root, user_request):
                 "exists": os.path.isfile(full_path)
             }
         )
+
+    # Cross-project fallback: if the requested file does NOT exist
+    # in the current project, scan other configured projects for
+    # the same relative path. This prevents "File not found" when
+    # the user's project selection differs from where the file
+    # actually lives (e.g. agent-test vs local-agent both contain
+    # projects.json).
+    if results and not any(r["exists"] for r in results):
+        try:
+            all_projects = load_projects()
+        except Exception:
+            all_projects = {}
+        current_root = os.path.abspath(project_root)
+        for name, root in all_projects.items():
+            if not root:
+                continue
+            try:
+                other_root = os.path.abspath(root)
+            except Exception:
+                continue
+            if other_root == current_root:
+                continue
+            for r in results:
+                if r["exists"]:
+                    continue
+                try:
+                    candidate_full = os.path.join(
+                        other_root, r["relative_path"]
+                    )
+                    if os.path.isfile(candidate_full):
+                        r["full_path"] = candidate_full
+                        r["exists"] = True
+                        r["found_in_project"] = name
+                except Exception:
+                    pass
+            if all(r["exists"] for r in results):
+                break
 
     return results
 
@@ -14666,7 +14718,15 @@ def run_agent_legacy(
         project_root,
         user_request
     )
-    requested_file = requested_files[0] if requested_files else None
+    requested_file_entry = requested_files[0] if requested_files else None
+    requested_file = requested_file_entry["relative_path"] if requested_file_entry else None
+    # Use the resolved full_path when find_requested_files found the
+    # file in another project (cross-project fallback).
+    resolved_full_path = (
+        requested_file_entry["full_path"]
+        if requested_file_entry and requested_file_entry.get("exists")
+        else None
+    )
 
     should_search = False
     if not requested_file:
@@ -14894,10 +14954,16 @@ REAL PROJECT STRUCTURE (root level):
         return sensitive_read_refusal_text(requested_file)
 
     try:
-        current_content = read_file(
-            project_root,
-            requested_file
-        )
+        # Use the resolved full path when find_requested_files found
+        # the file in another project (cross-project fallback).
+        if resolved_full_path and os.path.isfile(resolved_full_path):
+            with open(resolved_full_path, "r", encoding="utf-8") as f:
+                current_content = f.read()
+        else:
+            current_content = read_file(
+                project_root,
+                requested_file
+            )
 
     except Exception as e:
         # Build a helpful error that suggests other projects containing
