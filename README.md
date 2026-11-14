@@ -81,3 +81,7 @@ Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 Released under the [MIT](LICENSE) license.
+
+## Connect with Me
+- [LinkedIn](https://www.linkedin.com/in/mehrdad-haghi-955525383/)
+- [GitHub](https://github.com/mehrdad5454)

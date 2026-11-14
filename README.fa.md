@@ -84,3 +84,7 @@ pytest -q
 - پیش از تغییرات مهم، از وجود بکاپ و وضعیت Git مطمئن شوید.
 - برای جزئیات وضعیت فعلی، به `PROJECT_STATUS.md` مراجعه کنید.
 - هرگز فایل‌های حساس (`.env`، `projects.json`، `chat-history.db`) را commit نکنید؛ این فایل‌ها در `.gitignore` هستند.
+
+## ارتباط با من
+- [لینکدین](https://www.linkedin.com/in/mehrdad-haghi-955525383/)
+- [گیت‌هاب](https://github.com/mehrdad5454)
