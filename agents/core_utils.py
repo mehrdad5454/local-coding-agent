@@ -1617,6 +1617,16 @@ def summarize_validation(validation):
 
     return lines
 
+def is_emergency_stop_requested():
+    # منبع مرکزی توقف اضطراری.
+    #
+    # این تابع پیش‌تر فقط در agent.py تعریف شده بود، در حالی
+    # که همین فایل و agents/tools/file_tools.py آن را صدا
+    # می‌زدند؛ نتیجه NameError در زمان اجرا بود. تعریف اینجا
+    # باعث می‌شود هسته و ابزارها یک Event مشترک ببینند.
+    return EMERGENCY_STOP_EVENT.is_set()
+
+
 def is_stop_requested(stop_event=None):
     # بررسی مشترک: منبع مرکزی + stop_event فعلی.
     if is_emergency_stop_requested():

@@ -7140,7 +7140,12 @@ def build_pending_revalidation_report(pending, reason):
 # یک منبع Stop مرکزی داشته باشیم و stop_event فعلی هم بدون
 # تغییر کار کند.
 
-EMERGENCY_STOP_EVENT = threading.Event()
+# یک منبع واحد برای توقف اضطراری: همان Event که در
+# agents/core_utils.py تعریف شده است. پیش‌تر اینجا یک Event
+# دوم ساخته می‌شد، پس request_emergency_stop() هسته را
+# متوقف می‌کرد ولی بررسی‌های agents/tools/file_tools.py
+# هرگز آن را نمی‌دیدند.
+from agents.core_utils import EMERGENCY_STOP_EVENT
 
 EMERGENCY_STOP_MESSAGE = (
     "Emergency Stop فعال است؛ عملیات اجرا نشد."
@@ -10210,6 +10215,16 @@ You are a professional coding assistant. For every request:
 - For reading a file: read_file.
 - For listing a directory: list_directory.
 - For searching: search_in_files.
+- For creating a NEW FILE: write_file.
+- For creating a NEW DIRECTORY: create_directory.
+  Never confuse these two.
+- If the target path has a file extension (.txt, .py, .md, .html,
+  .css, .js, .json, .php), you MUST use write_file, never
+  create_directory.
+- write_file ARGS must contain a NON-EMPTY "content" string.
+  "content": "" is rejected and the step is wasted. If the user did
+  not give content, write a short meaningful placeholder body and
+  mention it in FINAL.
 - Always verify that you called the tool correctly before answering.
 - Provide structured responses (Step 1, Step 2, ...).
 
@@ -10253,6 +10268,9 @@ these Persian headings, in this order:
 ## پیشنهاد قدم بعد
 
 RULES:
+- FILE vs DIRECTORY: to create a FILE use write_file; to create a
+  DIRECTORY use create_directory. A path with an extension
+  (test-approval.txt, app.py, notes.md) is a FILE -> write_file.
 - Use exactly ONE tool per step. Never write two TOOL blocks.
 - Write tool names exactly as listed above.
 - ARGS must be valid JSON on one line.
