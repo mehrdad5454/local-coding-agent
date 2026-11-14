@@ -1,84 +1,83 @@
-# Local Agent
+# Local Coding Agent
 
-یک **Coding Agent لوکال** برای انجام وظایف مهندسی نرم‌افزار و تحلیل/پژوهش در محیط محلی، با رابط وب و خط فرمان، تمرکز بر کنترل تغییرات (برنامه‌ریزی، تأیید، backup/rollback، journal/evidence) و قابلیت‌های چندایجنتی.
+A local coding agent powered by Qwen3-8B and llama.cpp. No cloud, no API keys, runs entirely on your machine.
 
-## پیش‌نیازها
-- **Python 3.14+** (پروژه با Python 3.14.6 توسعه/آزموده شده)
-- **llama.cpp** یا هر سرور مدل سازگار که endpoint تکمیل متن را فراهم کند
-- حداقل **16GB RAM** (بسته به مدل؛ مدل‌های بزرگ‌تر به RAM/VRAM بیشتری نیاز دارند)
-- سیستم‌عامل: Windows (دستورهای زیر با PowerShell/CMD نوشته شده‌اند)
+It ships with a web UI and a CLI, and focuses on change control (plan, approval, backup/rollback, journal/evidence) and multi-agent capabilities.
 
-## نصب
+[Persian version](README.fa.md)
+
+## Prerequisites
+- **Python 3.14+** (developed and tested on Python 3.14.6)
+- **llama.cpp** or any model server that exposes a text-completion endpoint
+- At least **16GB RAM** (depends on the model; larger models need more RAM/VRAM)
+- OS: Windows (the commands below are written for PowerShell/CMD)
+
+## Installation
 ```powershell
-# 1) ساخت محیط مجازی
+# 1) create a virtual environment
 python -m venv .venv
 
-# 2) فعال‌سازی (PowerShell)
+# 2) activate it (PowerShell)
 .\.venv\Scripts\Activate.ps1
-# یا (CMD)
+# or (CMD)
 .\.venv\Scripts\activate.bat
 
-# 3) نصب وابستگی‌ها
+# 3) install dependencies
 pip install -r requirements.txt
 ```
 
-## راه‌اندازی مدل (llama.cpp + Qwen3-8B یا مدل دیگر)
-پروژه به‌صورت پیش‌فرض از `MODEL_URL=http://127.0.0.1:8080/completion` استفاده می‌کند (قابل تغییر با متغیر محیطی `MODEL_URL`).
+## Model Setup
+The project uses `MODEL_URL=http://127.0.0.1:8080/completion` by default (override it with the `MODEL_URL` environment variable).
 
-نمونه اجرای سرور `llama.cpp` (مسیرها و نام باینری را مطابق سیستم خود جایگزین کنید):
+Example `llama.cpp` server launch (replace paths and binary name for your system):
 ```powershell
-# مثال: اجرای llama-server با یک مدل GGUF (مانند Qwen3-8B)
+# example: run llama-server with a GGUF model (e.g. Qwen3-8B)
 llama-server `
   -m "D:\models\Qwen3-8B-Instruct-Q4_K_M.gguf" `
   --host 127.0.0.1 `
   --port 8080 `
   -c 8192
 ```
-- می‌توانید هر مدل GGUF سازگار دیگری را جایگزین کنید؛ اندازه context (`-c`) و پارامترها را بر اساس منابع سیستم تنظیم کنید.
-- پس از اجرا، endpoint `http://127.0.0.1:8080/completion` باید در دسترس باشد.
+- You can use any compatible GGUF model; tune the context size (`-c`) and parameters to your hardware.
+- After it starts, `http://127.0.0.1:8080/completion` must be reachable.
 
-## اجرا
+## Running
 ```powershell
-# رابط وب (Flask)
+# web interface (Flask)
 python web_agent.py
 
-# یا حالت خط فرمان
+# or the command-line mode
 python agent.py
 ```
 
-## قابلیت‌ها
-- **تأیید تغییرات (Pending Approval):** ابزارهای تغییردهنده پیش از اجرا یک Plan می‌سازند و منتظر تأیید صریح کاربر می‌مانند؛ تا تأیید نشود هیچ فایلی روی دیسک تغییر نمی‌کند.
-- **Popup تأیید در رابط وب:** با شناسایی Plan در انتظار، دیالوگ تأیید/لغو به‌طور خودکار باز می‌شود و پس از اجرا، نتیجه و Verify نمایش داده می‌شود.
-- **نظارت زنده:** نمایش مرحله‌ای تصمیم مدل، ابزار انتخابی و وضعیت تأیید.
-- **Emergency Stop:** توقف اضطراری یکپارچه برای هسته و ابزارها (رویداد مشترک `EMERGENCY_STOP_EVENT`).
+## Features
+- **Pending Approval:** mutating tools build a plan first and wait for explicit user approval; nothing is written to disk until you approve.
+- **Approval popup in the web UI:** when a plan is waiting, the approve/cancel dialog opens automatically, and the result plus Verify is shown after execution.
+- **Live monitoring:** step-by-step view of the model's decision, the chosen tool and the approval state.
+- **Emergency Stop:** one unified stop event for the core and the tools (shared `EMERGENCY_STOP_EVENT`).
 
-## تست
+## Testing
 ```powershell
 pytest -q
 ```
-(در صورت استفاده از محیط مجازی: `.\.venv\Scripts\python.exe -m pytest -q`)
+(inside the virtual environment: `.\.venv\Scripts\python.exe -m pytest -q`)
 
-## ساختار پروژه
-- `agent.py` — هسته اصلی عامل: ابزارها، حلقه اجرا، ایمنی، برنامه‌ریزی/تأیید تغییرات، backup/rollback، journal/verify.
-- `web_agent.py` — رابط وب برای تعامل با عامل.
-- `web_research.py` — ابزارهای وب read-only (جستجو و استخراج متن صفحه).
-- `agents/` — معماری چندایجنتی: ارکستراتور، ایجنت‌های تخصصی، قابلیت‌ها/مجوزها، اکشن‌ها، completion gate.
-- `evidence/` — ثبت موقت شواهد و دروازه استناد (citation/evidence ledger).
-- `memory/` — لایه و پیاده‌سازی حافظه مکالمه (SQLite).
-- `tests/` — تست‌های خودکار (pytest) برای evidence، routing، ایمنی تغییرات و سناریوهای وب.
-- `general_workspace/` — فضای کاری ایزوله برای اجرای وظایف در حالت عمومی (در صورت استفاده/فعال‌سازی).
-- `PROJECT_STATUS.md` — گزارش وضعیت فعلی پروژه و مرجع تصمیم‌گیری.
+## Project Structure
+- `agent.py` — the agent core: tools, execution loop, safety, change planning/approval, backup/rollback, journal/verify.
+- `web_agent.py` — the web interface for talking to the agent.
+- `web_research.py` — read-only web tools (search and page text extraction).
+- `agents/` — multi-agent architecture: orchestrator, specialist agents, capabilities/permissions, actions, completion gate.
+- `evidence/` — temporary evidence store and the citation/evidence ledger.
+- `memory/` — conversation memory layer (SQLite).
+- `tests/` — automated pytest suite for evidence, routing, change safety and web scenarios.
+- `general_workspace/` — isolated workspace for tasks in general mode (when used/enabled).
+- `PROJECT_STATUS.md` — current project status report and decision reference.
 
-## مشارکت
-برای مشارکت، راهنمای [CONTRIBUTING.md](CONTRIBUTING.md) را مطالعه کنید. تغییرات از طریق Issue و Pull Request پذیرفته می‌شوند.
+## Contributing
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted through issues and pull requests.
 
-## تغییرات
-تاریخچه تغییرات در [CHANGELOG.md](CHANGELOG.md) ثبت می‌شود.
+## Changelog
+Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
-## لایسنس
-این پروژه تحت لایسنس [MIT](LICENSE) منتشر شده است.
-
-## یادداشت‌ها
-- پیش از تغییرات مهم، از وجود بکاپ و وضعیت Git مطمئن شوید.
-- برای جزئیات وضعیت فعلی، به `PROJECT_STATUS.md` مراجعه کنید.
-- هرگز فایل‌های حساس (`.env`، `projects.json`، `chat-history.db`) را commit نکنید؛ این فایل‌ها در `.gitignore` هستند.
+## License
+Released under the [MIT](LICENSE) license.
