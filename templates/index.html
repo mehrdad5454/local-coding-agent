@@ -135,6 +135,25 @@
             <button type="button" id="stopButton" class="btn" disabled>توقف اجرا</button>
           </div>
 
+          <div id="approvalModal" class="modal-overlay hidden" aria-hidden="true">
+            <div class="modal" role="dialog" aria-modal="true" aria-labelledby="approvalTitle">
+              <div class="modal-header">
+                <h2 id="approvalTitle">تأیید تغییرات</h2>
+              </div>
+              <div class="modal-body">
+                <p>نوع عملیات: <span id="approvalTool"></span></p>
+                <p>پروژه: <span id="approvalProjectLabel"></span></p>
+                <p>فایل‌های درگیر:</p>
+                <ul id="approvalFiles"></ul>
+                <pre id="approvalSummary"></pre>
+              </div>
+              <div class="actions">
+                <button type="button" id="approvalApprove" class="btn primary">تأیید و اعمال</button>
+                <button type="button" id="approvalCancel" class="btn">رد عملیات</button>
+              </div>
+            </div>
+          </div>
+
           <div id="settingsModal" class="modal-overlay hidden" aria-hidden="true">
             <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
               <div class="modal-header">
@@ -275,7 +294,7 @@
   var modeHint = document.getElementById('modeHint');
 
   function detectIntent(text) {
-    var t = (text || '').toLower();
+    var t = (text || '').toLowerCase();
     var writeRe = /(بنویس|ایجاد|بساز|اضافه|ویرایش|تغییر|اصلاح|حذف|پاک|rename|refactor|fix|update|create|write|add|remove|delete|edit|modify|patch|replace|commit)/i;
     var readRe = /(بخوان|بررسی|چک|نمایش|نشان|لیست|جستجو|پیدا|توضیح|تحلیل|خواندن|review|read|show|list|find|search|explain|inspect|check|analyz)/i;
     return { write: writeRe.test(t), read: readRe.test(t) };
@@ -297,7 +316,8 @@
     if (hasWrite && !hasRead) { writeRadio.checked = true; }
     else if (hasRead && !hasWrite) { readRadio.checked = true; }
     else if (hasWrite && hasRead) {
-      if (!readRadio.checked && !writeRadio.checked) readRadio.checked = true;
+      if (hasWrite && !readRadio.checked && !writeRadio.checked) writeRadio.checked = true;
+      else if (!readRadio.checked && !writeRadio.checked) readRadio.checked = true;
       if (readRadio.checked && readRadio.disabled) writeRadio.checked = true;
       if (writeRadio.checked && writeRadio.disabled) readRadio.checked = true;
     } else {
@@ -431,6 +451,85 @@ function renderChatHistory(history) {
   var copyBtn = document.getElementById('copyButton');
   if (copyBtn) copyBtn.addEventListener('click', function(){ var b=document.getElementById('resultBox'); copyText(b?b.textContent:'', copyBtn); });
 
+  var lastPendingPlanId = null;
+  var lastPendingProject = '';
+
+  function setApprovalVisible(on) {
+    var box = document.getElementById('approvalModal');
+    if (!box) return;
+    if (on) { box.classList.remove('hidden'); box.setAttribute('aria-hidden', 'false'); }
+    else { box.classList.add('hidden'); box.setAttribute('aria-hidden', 'true'); }
+  }
+
+  function renderPendingApproval(data) {
+    var toolEl = document.getElementById('approvalTool');
+    var projEl = document.getElementById('approvalProjectLabel');
+    var filesEl = document.getElementById('approvalFiles');
+    var sumEl = document.getElementById('approvalSummary');
+
+    if (toolEl) toolEl.textContent = data.pending_tool || '';
+    if (projEl) projEl.textContent = data.pending_project || '';
+
+    if (filesEl) {
+      filesEl.innerHTML = '';
+      var list = data.pending_files || [];
+      if (!list.length) {
+        var empty = document.createElement('li');
+        empty.textContent = '—';
+        filesEl.appendChild(empty);
+      }
+      for (var i = 0; i < list.length; i++) {
+        var item = document.createElement('li');
+        item.textContent = list[i];
+        filesEl.appendChild(item);
+      }
+    }
+
+    if (sumEl) sumEl.textContent = data.pending_summary || '';
+  }
+
+  function postApproval(action) {
+    var params = new URLSearchParams();
+    params.set('csrf_token', csrfToken);
+    params.set('approval_action', action);
+    params.set('mode', action === 'approve' ? 'write' : 'read');
+
+    var proj = lastPendingProject || '';
+    if (!proj) {
+      var projEl = document.getElementById('projectHidden');
+      proj = projEl ? projEl.value : '';
+    }
+    params.set('project', proj);
+
+    var sessEl = document.querySelector('input[name="session_id"]');
+    if (sessEl && sessEl.value) params.set('session_id', sessEl.value);
+
+    fetch('/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    }).then(function(){ window.location.reload(); })
+      .catch(function(){ window.location.reload(); });
+  }
+
+  function pollPendingApproval(data) {
+    if (!data || !data.pending_approval) { setApprovalVisible(false); lastPendingPlanId = null; return; }
+
+    var planId = data.pending_plan_id || '';
+    if (!planId) { setApprovalVisible(false); return; }
+    if (planId === lastPendingPlanId) return;
+
+    lastPendingPlanId = planId;
+    lastPendingProject = data.pending_project || '';
+    renderPendingApproval(data);
+    setApprovalVisible(true);
+  }
+
+  var approvalApprove = document.getElementById('approvalApprove');
+  var approvalCancel = document.getElementById('approvalCancel');
+  if (approvalApprove) approvalApprove.addEventListener('click', function(){ postApproval('approve'); });
+  if (approvalCancel) approvalCancel.addEventListener('click', function(){ postApproval('cancel'); });
+
   function pollStatus() {
     fetch('/status').then(function(r){ return r.json(); }).then(function(data){
       setConn(true);
@@ -440,6 +539,7 @@ function renderChatHistory(history) {
       if (banner) banner.className = 'status-line status-' + st;
       renderProgress(data.progress || []);
       renderLastResult(data);
+      pollPendingApproval(data);
       if (st === 'running') { setThinking(true); if (stopButton) stopButton.disabled = false; if (submitButton) { submitButton.disabled = true; submitButton.textContent = 'در حال اجرا...'; } }
       else { setThinking(false); if (stopButton) stopButton.disabled = true; if (submitButton) { submitButton.disabled = false; submitButton.textContent = 'اجرای درخواست'; } }
     }).catch(function(){ setConn(false); });

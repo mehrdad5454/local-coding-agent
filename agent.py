@@ -14528,7 +14528,7 @@ def run_agent(
                     _allowed = _WEB_RESEARCH_ALLOWED_TOOLS
                 loop_result = run_agentic_loop(
                     user_request,
-                    None,
+                    project_root,
                     project_name,
                     allow_write=allow_write,
                     stop_event=stop_event,

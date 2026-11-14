@@ -757,6 +757,67 @@ def has_pending_approval():
     return get_pending_action() is not None
 
 
+def pending_approval_payload():
+    # Snapshot فقط-خواندنی از Pending موجود برای Pop-up تأیید.
+    # هیچ Pending تازه‌ای ساخته نمی‌شود و هیچ Approval موازی نیست.
+    empty = {
+        "pending_approval": False,
+        "pending_plan_id": "",
+        "pending_project": "",
+        "pending_tool": "",
+        "pending_files": [],
+        "pending_summary": "",
+    }
+
+    pending = get_pending_action()
+
+    if not isinstance(pending, dict):
+        return empty
+
+    args = pending.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    context = pending.get("context")
+    if not isinstance(context, dict):
+        context = {}
+
+    files = []
+    for item in (context.get("batch_paths") or []):
+        if str(item):
+            files.append(str(item))
+
+    if not files:
+        single = (
+            args.get("path")
+            or args.get("relative_path")
+            or args.get("file")
+            or context.get("target")
+        )
+        if single:
+            files = [str(single)]
+
+    summary = ""
+    try:
+        summary = build_pending_plan_text(
+            str(pending.get("tool") or ""),
+            args,
+            pending.get("project_root") or "",
+            write_mode=True
+        ) or ""
+    except Exception:
+        summary = ""
+
+    return {
+        "pending_approval": True,
+        "pending_plan_id": str(pending.get("plan_id") or ""),
+        "pending_project": str(pending.get("project") or ""),
+        "pending_tool": str(pending.get("tool") or ""),
+        "pending_files": files,
+        "pending_summary": summary,
+    }
+
+
 @app.after_request
 def add_cors_headers(response):
     # Phase 1 — Web Security.
@@ -3223,6 +3284,8 @@ def stop_route():
 @app.route("/status", methods=["GET"])
 def status_route():
     # وضعیت فعلی Agent (فقط در لایه web نگه داشته می‌شود).
+    pending_payload = pending_approval_payload()
+
     return (
         jsonify(dict(
             get_agent_status(),
@@ -3231,7 +3294,12 @@ def status_route():
             last_result=strip_think_tags(last_result),
             # فقط خواندن وضعیت Pending Action برای نمایش
             # دکمه‌های تأیید/لغو؛ هیچ تغییری ایجاد نمی‌کند.
-            pending_approval=has_pending_approval(),
+            pending_approval=pending_payload["pending_approval"],
+            pending_plan_id=pending_payload["pending_plan_id"],
+            pending_project=pending_payload["pending_project"],
+            pending_tool=pending_payload["pending_tool"],
+            pending_files=pending_payload["pending_files"],
+            pending_summary=pending_payload["pending_summary"],
             provider=runtime_info["provider"],
             model=runtime_info["model"],
             started_at=runtime_info["started_at"],
